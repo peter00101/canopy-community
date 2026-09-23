@@ -1,0 +1,33 @@
+diff --git a/dist/utils/retry.js b/dist/utils/retry.js
+index 6538c63..4327603 100644
+--- a/dist/utils/retry.js
++++ b/dist/utils/retry.js
+@@ -63,9 +63,28 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+     // "stream ended without ..." and "Anthropic stream ended before message_stop"
+     // (#4433); Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
+     "ended without",
++    // Pi's exact stream-consumption failure code: retry in the same transcript.
++    "\\bstream_read_error\\b",
++    // Some OpenAI-compatible gateways omit "response" in this terminal-event error.
++    "stream ended before (?:a )?terminal(?: response)? event",
+     "stream ended before message_stop",
+     "stream ended before a terminal response event",
+     "http2 request did not get a response",
++    // HTTP chunked/SSE proxies can close before the complete response body arrives.
++    "unexpected non-whitespace character after JSON",
++    "peer closed connection",
++    "incomplete chunked read",
++    // Browser/undici wording: `TypeError: Failed to fetch`.
++    "failed to fetch",
++    // Relay gateways that inject a Claude Code system prompt push it into the
++    // `messages` array when the top-level `system` field is already taken; some
++    // upstream channels behind the same gateway reject a `system` role there.
++    // Retrying re-routes to another channel of the pool and succeeds, so this is
++    // a per-channel transient failure rather than a malformed request. Measured
++    // 2026-09-21: identical request swung between 0% and 25% failure as the pool
++    // health changed, and plain retries on the same identity recovered.
++    "role ['\\\"]?system['\\\"]? is not supported",
++    "messages\\.\\d+: role ['\\\"]?system['\\\"]?",
+     // Provider-requested retry delay cap failures should flow through the outer
+     // retry policy so callers can surface/abort the backoff (#1123).
+     "retry delay",

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 260" width="180" height="260">
+  <!-- 薰衣草雾：灰紫晨空 + 淡月 + 雾带 + 斜坡薰衣草田 -->
+  <defs>
+    <linearGradient id="lav-sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e9e4f2"/>
+      <stop offset="1" stop-color="#d9d2ea"/>
+    </linearGradient>
+    <linearGradient id="lav-field" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a291c7"/>
+      <stop offset="1" stop-color="#7c68a8"/>
+    </linearGradient>
+  </defs>
+  <rect width="180" height="260" fill="url(#lav-sky)"/>
+  <!-- 淡月 -->
+  <circle cx="46" cy="56" r="20" fill="#f5f2fb"/>
+  <circle cx="52" cy="52" r="17" fill="#e9e4f2"/>
+  <!-- 远山 -->
+  <path d="M0 128 L52 92 L104 126 L146 100 L180 122 V260 H0 Z" fill="#b8abd4"/>
+  <!-- 雾带 -->
+  <rect x="0" y="122" width="180" height="16" fill="#f2eef9" opacity="0.75"/>
+  <rect x="0" y="142" width="180" height="9" fill="#f2eef9" opacity="0.45"/>
+  <!-- 薰衣草田斜坡 -->
+  <path d="M0 168 Q90 148 180 164 V260 H0 Z" fill="url(#lav-field)"/>
+  <!-- 田垄：透视收束的条纹 -->
+  <g stroke="#5d4a8c" stroke-width="4" stroke-linecap="round" opacity="0.55">
+    <path d="M18 260 Q30 214 44 178"/>
+    <path d="M58 260 Q66 216 76 180"/>
+    <path d="M98 260 Q102 218 108 182"/>
+    <path d="M138 260 Q138 220 140 184"/>
+    <path d="M172 260 Q170 224 168 188"/>
+  </g>
+  <!-- 穗尖高光 -->
+  <g fill="#cdbfe6">
+    <circle cx="44" cy="176" r="3"/>
+    <circle cx="76" cy="178" r="3"/>
+    <circle cx="108" cy="180" r="3"/>
+    <circle cx="140" cy="182" r="3"/>
+    <circle cx="168" cy="186" r="3"/>
+  </g>
+</svg>

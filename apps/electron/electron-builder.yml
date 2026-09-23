@@ -1,0 +1,231 @@
+# electron-builder 配置
+# 文档: https://www.electron.build/configuration/configuration
+
+appId: com.canopy.community
+productName: Canopy Community
+copyright: Copyright © 2024-2026 Canopy Community contributors
+
+# Electron 版本（CI 环境 bun workspace 下无法自动检测，需显式指定）
+electronVersion: 43.2.0
+
+# 目录配置
+directories:
+  output: out
+  buildResources: resources
+
+# 压缩配置
+compression: normal
+
+# ASAR 打包配置
+# 启用 ASAR 归档，将 Pi native addon 与其它 native binary 解压到 app.asar.unpacked/ 避免路径问题
+asar: true
+asarUnpack:
+  - "node_modules/@silvia-odwyer/**"
+  - "node_modules/@mariozechner/**"
+  - "node_modules/@napi-rs/**"
+  - "node_modules/@earendil-works/pi-tui/native/**"
+  - "node_modules/sharp/**"
+  - "node_modules/@img/**"
+  # node-pty 的 platform-native .node 与 ConPTY helper 不能留在 asar 内。
+  - "node_modules/node-pty/**"
+  # Pi 0.85 的 chord 在运行时加载 esbuild，其平台二进制必须位于 ASAR 外。
+  - "**/node_modules/esbuild/**"
+  - "**/node_modules/@esbuild/**"
+
+# 跳过 npm install（代码已被 esbuild/Vite 打包，npm 不识别 workspace:* 协议）
+npmRebuild: false
+
+# 通用文件配置
+files:
+  - dist/**/*
+  # build:resources 会把 resources 拷到 dist/，但 electron-builder 已通过 buildResources
+  # 直接使用原始资源；仅保留 Linux runtime 需要的 icon.png，避免重复打包。
+  - "!dist/resources/**"
+  - "dist/resources/icon.png"
+  - package.json
+  # Pi runtime 作为主进程 external 运行。打包前 sync:runtime-deps 会
+  # 将 external 依赖闭包同步到 apps/electron/node_modules。
+  - node_modules/**/*
+  # 排除 workspace 包的 symlink（代码已被 esbuild/Vite 打包到 dist/ 中）
+  - "!node_modules/@canopy/**"
+  # 排除明确只在开发/构建期使用的大体积包。
+  - "!node_modules/electron/**"
+  - "!node_modules/electron-builder/**"
+  - "!node_modules/electronmon/**"
+  - "!node_modules/@electron/**"
+  - "!node_modules/@electron-builder/**"
+  # ⚠️ 不要把 esbuild / @esbuild 排除回去：Pi 0.85 的 pi-coding-agent 根入口经
+  # experimental/plugins/package.js 静态 import @earendil-works/chord/bundler，
+  # 而 chord/dist/node/bundle.js 顶层就 `import { build } from "esbuild"`——
+  # 一加载 Pi SDK 就必须能 resolve 到它。0.18.55 及以前只是靠 chord 的**嵌套**副本
+  # （旧规则的顶层锚定 glob 匹配不到）侥幸进包；一旦 bun 布局变化让嵌套副本消失，
+  # 打包版 Agent 一启动就 ERR_MODULE_NOT_FOUND。收上游 #2003 的做法显式带上。
+  - node_modules/esbuild/**
+  - node_modules/@esbuild/**
+  # 排除 Pi SDK 纯演示/文档/sourcemap 内容，保留运行时必需文件。
+  - "!node_modules/@earendil-works/*/examples/**"
+  - "!node_modules/@earendil-works/*/docs/**"
+  - "!node_modules/@earendil-works/**/*.map"
+
+# 通用额外资源
+extraResources:
+  # canopy CLI 自包含二进制（build:cli 用 bun build --compile 产出到 resources/bin/）。
+  # 运行时由主进程注入 CANOPY_CLI 环境变量，暴露给 skill / Agent 调用。
+  - from: resources/bin
+    to: bin
+    filter:
+      - "**/*"
+  # OfficeCLI Excel 高保真渲染器；由 prepare:officecli 下载、固定版本并校验 SHA-256。
+  - from: resources/officecli
+    to: officecli
+    filter:
+      - "**/*"
+  # 默认 Skills 模板（首次启动时同步到 ~/.canopy/default-skills/）
+  - from: default-skills
+    to: default-skills
+    filter:
+      - "**/*"
+  # 教程文件（教程查看器 + 欢迎对话使用）
+  - from: resources/tutorial.md
+    to: tutorial.md
+  # 教程配图；tutorial-service 把 markdown 里的相对路径改写为此目录下的绝对路径
+  - from: resources/tutorial-images
+    to: tutorial-images
+    filter:
+      - "**/*"
+  # Canopy 品牌 Logo 素材（品牌素材下载功能使用）
+  - from: resources/canopy-logos
+    to: canopy-logos
+    filter:
+      - "**/*"
+  # PSD 高保真桥接脚本：用户机器上有 Python + psd-tools 时由主进程调用（缺则回退内置 ag-psd）
+  - from: resources/psd
+    to: psd
+    filter:
+      - "**/*"
+  # 默认 Dock 图标（macOS app.dock.setIcon 使用）
+  - from: resources/icon.png
+    to: icon.png
+  # Renderer bundle 载入前显示的静态启动页，避免运行时检测期间出现空白窗口。
+  - from: resources/startup-splash
+    to: startup-splash
+    filter:
+      - "**/*"
+
+# ============================================
+# macOS 配置
+# ============================================
+mac:
+  category: public.app-category.developer-tools
+  icon: resources/icon.icns
+  # Swift/AppKit 原生灵动岛宿主；须显式标记为需签名的额外二进制。
+  extraResources:
+    - from: resources/agent-island/macos-agent-island-helper
+      to: agent-island/macos-agent-island-helper
+    # EventKit N-API bridge 在 Electron main 进程内执行，确保 TCC 归属 Canopy.app。
+    - from: resources/eventkit/macos-eventkit.node
+      to: eventkit/macos-eventkit.node
+  binaries:
+    - resources/agent-island/macos-agent-island-helper
+    - resources/eventkit/macos-eventkit.node
+    - resources/officecli/officecli
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  extendInfo:
+    NSMicrophoneUsageDescription: "Canopy Community 需要访问麦克风，用于将你的语音实时转写为文本。"
+    NSCalendarsFullAccessUsageDescription: "Canopy Community 需要访问你的日历，以显示、创建和同步你选择的日程。"
+    NSRemindersFullAccessUsageDescription: "Canopy Community 需要访问你的提醒事项，以同步 Todo 和你选择的列表。"
+  # 架构由 CLI 参数控制（CI 矩阵分别传 --arm64 / --x64），
+  # 每个 runner 只构建其宿主架构对应的产物，与 bun 按 os/cpu 装好的
+  # 每个 runner 只构建其宿主架构对应的产物。
+  target:
+    - dmg
+    - zip
+
+# DMG 配置
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+  window:
+    width: 540
+    height: 380
+
+# ============================================
+# Windows 配置
+# ============================================
+win:
+  icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+# NSIS 安装程序配置
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+# ============================================
+# Linux 配置（Ubuntu/Debian x86_64）
+# ============================================
+linux:
+  icon: resources/icon.png
+  executableName: canopy-community
+  desktop:
+    StartupWMClass: canopy-community
+  category: Development
+  synopsis: 本地优先的 AI 桌面 Agent
+  description: Canopy Community 把多模型 Chat、通用 Agent、工作区、Skills、MCP 与记忆能力放进同一个本地优先的桌面客户端，数据和配置默认留在本地（~/.canopy-community/）。
+  maintainer: Canopy Community <158817250+peter00101@users.noreply.github.com>
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+
+# electron-builder 25 对 AppImage 默认使用 --no-sandbox，这是 AppImage
+# 挂载文件系统无法可靠提供 SUID sandbox 的已知限制。deb 不继承该参数，
+# 而是通过 afterInstall 尝试配置 /opt/Canopy Community/chrome-sandbox。
+appImage:
+  executableArgs:
+    - --no-sandbox
+
+deb:
+  packageName: canopy-community
+  afterInstall: resources/linux/deb-after-install.sh
+  # 以 Ubuntu 22.04 为首个支持目标；显式声明，避免 electron-builder 的历史默认
+  # 依赖（如已废弃的 gconf2/libappindicator1）进入新包。
+  depends:
+    - libasound2
+    - libatk-bridge2.0-0
+    - libatspi2.0-0
+    - libdrm2
+    - libgbm1
+    - libgtk-3-0
+    - libnss3
+    - libx11-xcb1
+    - libxcomposite1
+    - libxdamage1
+    - libxfixes3
+    - libxkbcommon0
+    - libxrandr2
+    - libxss1
+  artifactName: canopy-community_${version}_${arch}.${ext}
+
+# ============================================
+# 发布配置
+# 自动更新功能已移除：安装包由维护者手动打包并直接分发给用户。
+# NSIS 安装包支持覆盖安装，用户数据在 ~/.canopy-community/ 不受影响。
+# ============================================
+publish: null

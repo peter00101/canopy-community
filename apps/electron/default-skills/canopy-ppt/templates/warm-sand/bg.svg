@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720" width="1280" height="720">
+  <g id="tpl-bg">
+    <rect x="0" y="0" width="1280" height="720" fill="#F6F1EA"/>
+    <circle cx="1150" cy="40" r="220" fill="#EAD9C8" fill-opacity="0.6"/>
+    <line x1="40" y1="684" x2="1240" y2="684" stroke="#E6DCD2" stroke-width="1"/>
+    <rect x="40" y="682" width="60" height="4" fill="#C46A3C"/>
+  </g>
+</svg>

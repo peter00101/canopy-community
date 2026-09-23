@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 相对上游 CSP 的两处增量：frame-src 与 media-src 追加 canopy-file:——
+         我方 PDF/HTML 内联预览走 canopy-file:// 的 iframe（DiffTabContent），
+         markdown 预览的本地媒体白名单也接受该协议（markdown-preview-extensions）。
+         上游只在 img-src 放行，照抄会打死整条预览链路。 -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http: https: canopy-file:; font-src 'self' data: http: https:; media-src 'self' data: blob: http: https: canopy-file:; connect-src 'self' http://127.0.0.1:5173 ws://127.0.0.1:5173 wss://127.0.0.1:5173 https:; object-src 'none'; base-uri 'self'; frame-src 'self' https: canopy-file:;"
+    />
+    <title>Canopy</title>
+    <script>
+      // 主题初始化脚本（在 React 加载前执行，避免闪烁）
+      // 从 localStorage 缓存读取主题模式和特殊风格，立即应用类名
+      ;(function() {
+        var mode = localStorage.getItem('canopy-theme-mode') || 'dark'
+        var style = localStorage.getItem('canopy-theme-style')
+        var html = document.documentElement
+
+        if (mode === 'special' && style && style !== 'default') {
+          // 特殊风格模式：添加主题类名 + 根据后缀决定 dark 类
+          html.classList.add('theme-' + style)
+          if (style.endsWith('-dark')) {
+            html.classList.add('dark')
+          }
+        } else if (mode === 'dark') {
+          html.classList.add('dark')
+        } else if (mode === 'system') {
+          if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+            html.classList.add('dark')
+          }
+        }
+        // mode === 'light' 时不添加 dark 类
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/main.tsx"></script>
+  </body>
+</html>

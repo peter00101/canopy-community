@@ -1,0 +1,687 @@
+import MarkdownIt from 'markdown-it'
+import { normalizeMalformedStrongDelimiters } from './markdown-emphasis'
+
+const VIDEO_EXT_RE = /\.(mp4|webm|ogg|ogv|mov|m4v)(?:[?#].*)?$/i
+const PREVIEW_BLOCK_RE = /^<div\s+[^>]*data-type=(["'])(?:raw-html-block|math-block)\1/i
+const DETAILS_BLOCK_RE = /<details(\s[^>]*)?>\s*<summary>([\s\S]*?)<\/summary>([\s\S]*?)<\/details>/gi
+const STANDALONE_HTML_MEDIA_RE = /^\s*<(?:img|video)\b[^>]*(?:\/?>|>.*?<\/video>)\s*$/i
+const LEADING_FRONTMATTER_RE = /^(?:\ufeff)?---[ \t]*\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?=\r?\n|$)/
+
+export const MARKDOWN_RENDERER_VERSION = 5
+
+const EMOJI_SHORTCODES: Record<string, string> = {
+  '+1': '👍',
+  '-1': '👎',
+  clap: '👏',
+  confused: '😕',
+  cry: '😢',
+  heart: '❤️',
+  joy: '😂',
+  laugh: '😆',
+  ok_hand: '👌',
+  rocket: '🚀',
+  smile: '😄',
+  sob: '😭',
+  tada: '🎉',
+  thinking: '🤔',
+  thumbsup: '👍',
+  thumbsdown: '👎',
+  warning: '⚠️',
+}
+
+function escapeAttr(value: string): string {
+  return value
+    .replace(/\r\n?/g, '\n')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '&#10;')
+}
+
+export interface MarkdownHeading {
+  level: number
+  text: string
+  /** CodeMirror document offset for source-backed navigation. */
+  position: number
+}
+
+interface MarkdownSourceLine {
+  text: string
+  offset: number
+}
+
+/** 按 CodeMirror 的换行规范拆行：CRLF 和孤立 CR 都在 Text 文档中占一个 `\n`。 */
+function splitMarkdownSourceLines(markdown: string): MarkdownSourceLine[] {
+  const lines: MarkdownSourceLine[] = []
+  let sourceOffset = 0
+  let codeMirrorOffset = 0
+  while (sourceOffset < markdown.length) {
+    const lineStart = sourceOffset
+    while (sourceOffset < markdown.length && markdown[sourceOffset] !== '\n' && markdown[sourceOffset] !== '\r') sourceOffset += 1
+    const text = markdown.slice(lineStart, sourceOffset)
+    lines.push({ text, offset: codeMirrorOffset })
+    codeMirrorOffset += text.length
+    if (markdown[sourceOffset] === '\r' && markdown[sourceOffset + 1] === '\n') sourceOffset += 2
+    else if (sourceOffset < markdown.length) sourceOffset += 1
+    if (sourceOffset > lineStart + text.length) codeMirrorOffset += 1
+  }
+  if (markdown.length === 0 || /(?:\r\n|\r|\n)$/.test(markdown)) {
+    lines.push({ text: '', offset: codeMirrorOffset })
+  }
+  return lines
+}
+
+function isStandaloneHtmlMedia(line: string): boolean {
+  return STANDALONE_HTML_MEDIA_RE.test(line)
+}
+
+/**
+ * 将与 markdownToHtml 相同的“非 Markdown 区域”遮掉，再交给 markdown-it 解析。
+ * 每行保留原始数量和顺序，token.map 的行号即可映射回 CodeMirror 偏移。
+ */
+function prepareHeadingSource(markdown: string): MarkdownSourceLine[] {
+  const lines = splitMarkdownSourceLines(markdown)
+  const normalized = lines.map((line) => line.text)
+  const first = normalized[0] ?? ''
+  const opening = /^(?:\ufeff)?---[ \t]*$/.test(first)
+  let frontmatterEnd = -1
+  if (opening) {
+    let body = ''
+    for (let index = 1; index < normalized.length; index += 1) {
+      const line = normalized[index] ?? ''
+      if (/^(?:---|\.\.\.)[ \t]*$/.test(line)) {
+        if (/^[A-Za-z0-9_-]+\s*:/m.test(body)) frontmatterEnd = index
+        break
+      }
+      body += `${line}\n`
+    }
+  }
+
+  return lines.map((line, index) => {
+    let text = normalized[index] ?? ''
+    if (index <= frontmatterEnd || isStandaloneHtmlMedia(text)) {
+      text = ' '.repeat(text.length)
+    } else {
+      // preprocessMarkdown removes these prefixes before parsing, without changing
+      // the source line's start offset used for navigation.
+      text = text
+        .replace(/^[\u200b\ufeff]+(?=#{1,6}\s)/, '')
+        .replace(/^\u00a0{1,3}(?=#{1,6}\s)/, (spaces) => ' '.repeat(spaces.length))
+    }
+    return { ...line, text }
+  })
+}
+
+export function extractMarkdownHeadings(markdown: string): MarkdownHeading[] {
+  const headings: MarkdownHeading[] = []
+  const sourceLines = prepareHeadingSource(markdown)
+  const parserSource = sourceLines.map((line) => line.text).join('\n')
+  const tokens = markdownIt.parse(parserSource, {})
+
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]
+    if (!token || token.type !== 'heading_open' || token.map?.[0] === undefined) continue
+    const level = Number(token.tag.slice(1))
+    if (!Number.isInteger(level) || level < 1 || level > 6) continue
+    const inline = tokens[index + 1]
+    const text = inline?.type === 'inline'
+      ? inline.children?.map((child) => {
+          if (child.type === 'image') return child.content
+          if (child.type === 'softbreak' || child.type === 'hardbreak') return ' '
+          return child.content
+        }).join('').trim() ?? ''
+      : ''
+    if (!text) continue
+    headings.push({ level, text, position: sourceLines[token.map[0]]?.offset ?? 0 })
+  }
+  return headings
+}
+
+export function parseImageWidth(value: unknown): number | null {
+  if (typeof value === 'string' && !/^\d+$/.test(value)) return null
+  const width = typeof value === 'number' || typeof value === 'string' ? Number(value) : NaN
+  return Number.isSafeInteger(width) && width > 0 && width <= 10_000 ? width : null
+}
+
+export function extractCodeText(codeEl: Element): string {
+  const parts: string[] = []
+  for (const child of Array.from(codeEl.childNodes)) {
+    if (child.nodeType === globalThis.Node.TEXT_NODE) {
+      parts.push(child.nodeValue || '')
+    } else if (child.nodeType === globalThis.Node.ELEMENT_NODE) {
+      const el = child as Element
+      if (el.tagName.toLowerCase() === 'br') {
+        parts.push('\n')
+      } else {
+        parts.push(el.textContent || '')
+      }
+    }
+  }
+  return parts.join('')
+}
+
+function escapeMarkdownText(value: string): string {
+  // /m 让 ^ 匹配每行行首，确保多行文本节点中每一行的块级标记都被转义。
+  // 这是必须的：在 markdown 中，行首的 # > + - 和有序列表标记会被解析为块级元素。
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/([`*_[\]<>|])/g, '\\$1')
+    .replace(/^(\s*)([#>+-])(?=\s)/gm, '$1\\$2')
+    .replace(/^(\s*)(\d+)\.(?=\s)/gm, '$1$2\\.')
+}
+
+function escapeMarkdownLinkTarget(value: string): string {
+  return `<${value.replace(/[<>\r\n]/g, (char) => encodeURIComponent(char))}>`
+}
+
+function serializeInlineCode(value: string): string {
+  if (!value.includes('`')) return `\`${value}\``
+  const fence = value.match(/`+/g)?.sort((a, b) => b.length - a.length)[0] ?? '`'
+  const wrapper = `${fence}\``
+  return `${wrapper} ${value} ${wrapper}`
+}
+
+function isPreviewBlockHtml(value: string): boolean {
+  return PREVIEW_BLOCK_RE.test(value.trim())
+}
+
+function addMathSupport(md: MarkdownIt): void {
+  md.inline.ruler.after('escape', 'math_inline', (state: any, silent: boolean) => {
+    const start = state.pos
+    if (state.src.charCodeAt(start) !== 0x24 || state.src.charCodeAt(start + 1) === 0x24) return false
+
+    let end = start + 1
+    while ((end = state.src.indexOf('$', end)) !== -1) {
+      if (state.src.charCodeAt(end - 1) !== 0x5c) break
+      end += 1
+    }
+    if (end === -1 || end === start + 1) return false
+
+    if (!silent) {
+      const token = state.push('math_inline', 'math', 0)
+      token.content = state.src.slice(start + 1, end)
+    }
+    state.pos = end + 1
+    return true
+  })
+
+  md.block.ruler.after('blockquote', 'math_block', (state: any, startLine: number, endLine: number, silent: boolean) => {
+    const start = state.bMarks[startLine] + state.tShift[startLine]
+    const max = state.eMarks[startLine]
+    const firstLine = state.src.slice(start, max)
+    if (!firstLine.startsWith('$$')) return false
+
+    if (silent) return true
+
+    let nextLine = startLine + 1
+    let content = firstLine.slice(2)
+    const sameLineEnd = content.lastIndexOf('$$')
+    if (sameLineEnd > 0) {
+      content = content.slice(0, sameLineEnd)
+    } else {
+      const lines: string[] = []
+      if (content.trim()) lines.push(content)
+      for (; nextLine < endLine; nextLine++) {
+        const lineStart = state.bMarks[nextLine] + state.tShift[nextLine]
+        const lineMax = state.eMarks[nextLine]
+        const line = state.src.slice(lineStart, lineMax)
+        const end = line.indexOf('$$')
+        if (end >= 0) {
+          lines.push(line.slice(0, end))
+          nextLine += 1
+          break
+        }
+        lines.push(line)
+      }
+      content = lines.join('\n')
+    }
+
+    const token = state.push('math_block', 'math', 0)
+    token.block = true
+    token.content = content.trim()
+    state.line = nextLine
+    return true
+  }, { alt: ['paragraph', 'reference', 'blockquote', 'list'] })
+
+  md.renderer.rules.math_inline = (tokens, idx) => (
+    `<span data-type="math-inline" data-latex="${escapeAttr(tokens[idx]?.content ?? '')}"></span>`
+  )
+  md.renderer.rules.math_block = (tokens, idx) => (
+    `<div data-type="math-block" data-latex="${escapeAttr(tokens[idx]?.content ?? '')}"></div>\n`
+  )
+}
+
+const markdownIt = new MarkdownIt({
+  html: true,
+  linkify: true,
+  breaks: false,
+})
+
+// 关闭 linkify 的模糊匹配：避免把形如 SKILL.md 的文件名（.md 被误判为摩尔多瓦 TLD）
+// 自动包装成 http://SKILL.md 这样的合成链接。带 scheme 的真实 URL（http(s)://...）
+// 仍会被正常链接。fuzzyEmail 同理关闭，防止 foo@bar.com 被误判。
+markdownIt.linkify.set({ fuzzyLink: false, fuzzyEmail: false })
+
+addMathSupport(markdownIt)
+
+markdownIt.core.ruler.after('inline', 'emoji_shortcode', (state: any) => {
+  for (const token of state.tokens) {
+    if (token.type !== 'inline' || !token.children) continue
+    for (const child of token.children) {
+      if (child.type !== 'text') continue
+      child.content = child.content.replace(/:([a-z0-9_+-]+):/gi, (raw: string, name: string) => (
+        EMOJI_SHORTCODES[name] ?? raw
+      ))
+    }
+  }
+})
+
+markdownIt.renderer.rules.html_block = (tokens, idx) => {
+  const content = (tokens[idx]?.content ?? '').trim()
+  if (!content) return ''
+  if (isPreviewBlockHtml(content)) return `${content}\n`
+  return `<div data-type="raw-html-block" data-markdown="${escapeAttr(content)}" data-html="${escapeAttr(content)}"></div>\n`
+}
+
+markdownIt.renderer.rules.html_inline = (tokens, idx) => (
+  `<span data-type="raw-html-inline" data-html="${escapeAttr(tokens[idx]?.content ?? '')}"></span>`
+)
+
+markdownIt.renderer.rules.image = (tokens, idx) => {
+  const token = tokens[idx]
+  if (!token) return ''
+  const src = token.attrGet('src') || ''
+  const title = token.attrGet('title') || ''
+  const alt = token.content || ''
+
+  if (VIDEO_EXT_RE.test(src)) {
+    return `<video data-type="markdown-video" src="${escapeAttr(src)}" title="${escapeAttr(alt || title)}" controls></video>`
+  }
+
+  const titleAttr = title ? ` title="${escapeAttr(title)}"` : ''
+  return `<img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}"${titleAttr}>`
+}
+
+markdownIt.renderer.rules.fence = (tokens, idx) => {
+  const token = tokens[idx]
+  if (!token) return ''
+  const info = token.info ? token.info.trim() : ''
+  const langName = info.split(/\s+/)[0] || ''
+  const escaped = markdownIt.utils.escapeHtml(token.content)
+  // 浏览器解析 <pre> 时会规范化连续换行符（\n\n → \n），导致空行丢失。
+  // 用 <br> 作为独立 DOM 节点不会被规范化，由 extractCodeText 在解析侧还原为 \n。
+  const preserved = escaped.replace(/\n\n/g, '<br>\n')
+  const classAttr = langName ? ` class="language-${markdownIt.utils.escapeHtml(langName)}"` : ''
+  return `<pre><code${classAttr}>${preserved}</code></pre>\n`
+}
+
+function wrapMarkdownDetailsBlocks(markdown: string): string {
+  return markdown.replace(DETAILS_BLOCK_RE, (raw: string, attrs = '', summary: string, body: string) => {
+    const bodyMarkdown = body.trim()
+    const bodyHtml = bodyMarkdown ? markdownIt.render(bodyMarkdown) : ''
+    const detailsHtml = `<details${attrs}><summary>${summary.trim()}</summary>${bodyHtml}</details>`
+    return `<div data-type="raw-html-block" data-markdown="${escapeAttr(raw.trim())}" data-html="${escapeAttr(detailsHtml)}"></div>`
+  })
+}
+
+function looksLikeYamlFrontmatter(body: string): boolean {
+  return /^[A-Za-z0-9_-]+\s*:/m.test(body)
+}
+
+function renderFrontmatterPreviewHtml(body: string): string {
+  const escapedBody = markdownIt.utils.escapeHtml(body.trim())
+  return [
+    '<details open class="rounded-xl border border-border/30 bg-muted/20 shadow-sm">',
+    '<summary class="cursor-pointer select-none px-4 py-3 text-sm font-medium text-foreground/70">前置元数据</summary>',
+    '<div class="px-4 pb-4">',
+    '<pre class="m-0 max-h-56 overflow-auto rounded-lg border border-border/30 bg-background/80 p-4 font-mono text-[13px] leading-7 whitespace-pre-wrap text-foreground/85">',
+    escapedBody,
+    '</pre>',
+    '</div>',
+    '</details>',
+  ].join('')
+}
+
+function extractLeadingFrontmatter(markdown: string): { frontmatter: string | null; body: string } {
+  const match = markdown.match(LEADING_FRONTMATTER_RE)
+  if (!match) return { frontmatter: null, body: markdown }
+
+  const rawFrontmatter = match[0] ?? ''
+  const body = match[1] ?? ''
+  if (!looksLikeYamlFrontmatter(body)) {
+    return { frontmatter: null, body: markdown }
+  }
+
+  return {
+    frontmatter: rawFrontmatter.trimEnd(),
+    body: markdown.slice(rawFrontmatter.length),
+  }
+}
+
+function wrapLeadingFrontmatterBlock(markdown: string): string {
+  const { frontmatter, body } = extractLeadingFrontmatter(markdown)
+  if (!frontmatter) return markdown
+
+  const content = frontmatter
+    .replace(/^(?:\ufeff)?---[ \t]*\r?\n/, '')
+    .replace(/\r?\n(?:---|\.\.\.)[ \t]*$/, '')
+  const previewHtml = renderFrontmatterPreviewHtml(content)
+  const previewBlock = `<div data-type="raw-html-block" data-markdown="${escapeAttr(frontmatter)}" data-html="${escapeAttr(previewHtml)}"></div>`
+  return body ? `${previewBlock}\n\n${body.replace(/^\r?\n/, '')}` : previewBlock
+}
+
+function splitMarkdownCodeRegions(markdown: string): Array<{ text: string; code: boolean }> {
+  const chunks: Array<{ text: string; code: boolean }> = []
+  const lines = markdown.split('\n')
+  let inFence: { marker: '`' | '~'; length: number } | null = null
+
+  const append = (text: string, code: boolean) => {
+    const last = chunks[chunks.length - 1]
+    if (last && last.code === code) {
+      last.text += text
+    } else {
+      chunks.push({ text, code })
+    }
+  }
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? ''
+    const lineWithBreak = i < lines.length - 1 ? `${line}\n` : line
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/)
+    const indentedCode = !inFence && /^(?: {4}|\t)/.test(line)
+    const isCode = Boolean(inFence || indentedCode)
+
+    append(lineWithBreak, isCode)
+
+    if (fenceMatch) {
+      const markerText = fenceMatch[1] ?? ''
+      const marker = markerText[0] as '`' | '~'
+      if (!inFence) {
+        inFence = { marker, length: markerText.length }
+      } else if (marker === inFence.marker && markerText.length >= inFence.length) {
+        inFence = null
+      }
+    }
+  }
+
+  return chunks
+}
+
+function separateStandaloneHtmlMediaBlocks(markdown: string): string {
+  const lines = markdown.split('\n')
+  const result: string[] = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i] ?? ''
+    result.push(line)
+    const nextLine = lines[i + 1] ?? ''
+    if (STANDALONE_HTML_MEDIA_RE.test(line) && nextLine.trim()) {
+      result.push('')
+    }
+  }
+  return result.join('\n')
+}
+
+function normalizeMarkdownLinePrefixes(markdown: string): string {
+  return markdown
+    .replace(/^[\u200b\ufeff]+(?=#{1,6}\s)/gm, '')
+    .replace(/^\u00a0{1,3}(?=#{1,6}\s)/gm, (spaces) => ' '.repeat(spaces.length))
+}
+
+/** 判断剪贴板纯文本是否包含足够明确的 Markdown 语法。 */
+export function looksLikeMarkdownText(value: string): boolean {
+  return /(?:^|\n)\s{0,3}(?:#{1,6}\s|[-+*]\s|>\s|```|~~~|\d+[.)]\s|---\s*$)|(?:\*\*|__|~~|`[^`\n]+`|\[[^\]\n]+\]\([^)]+\)|\|[^|\n]+\|)|(?:^|\s)(?:\*[^*\n]+\*|_[^_\n]+_)/m.test(value)
+}
+
+/** 判断剪贴板 HTML 是否已经携带可直接交给 TipTap 的富文本语义。 */
+export function hasRichClipboardMarkup(value: string): boolean {
+  return /<(?:strong|b|em|i|u|s|del|h[1-6]|ul|ol|li|blockquote|pre|code|hr|table|thead|tbody|tr|th|td|a|img|video)\b/i.test(value)
+}
+
+function preprocessMarkdown(markdown: string): string {
+  return splitMarkdownCodeRegions(wrapLeadingFrontmatterBlock(markdown))
+    .map((chunk) => chunk.code
+      ? chunk.text
+      : wrapMarkdownDetailsBlocks(separateStandaloneHtmlMediaBlocks(
+        normalizeMarkdownLinePrefixes(normalizeMalformedStrongDelimiters(chunk.text))
+      )))
+    .join('')
+}
+
+function enhanceMarkdownHtml(html: string): string {
+  if (typeof document === 'undefined') return html
+
+  const root = document.createElement('div')
+  root.innerHTML = html
+
+  for (const li of Array.from(root.querySelectorAll('li'))) {
+    let textNode: ChildNode | null = null
+    let first = li.firstChild
+    // Skip whitespace-only text nodes to find the meaningful first child
+    while (first && first.nodeType === Node.TEXT_NODE && !first.textContent?.trim()) {
+      first = first.nextSibling
+    }
+    if (first?.nodeType === Node.TEXT_NODE) {
+      textNode = first
+    } else if (first instanceof HTMLElement && first.tagName.toLowerCase() === 'p') {
+      let pChild = first.firstChild
+      while (pChild && pChild.nodeType === Node.TEXT_NODE && !pChild.textContent?.trim()) {
+        pChild = pChild.nextSibling
+      }
+      if (pChild?.nodeType === Node.TEXT_NODE) {
+        textNode = pChild
+      }
+    }
+    const text = textNode?.textContent ?? ''
+    const match = text.match(/^\s*\[([ xX])\]\s*/)
+    if (!match || !textNode) continue
+
+    textNode.textContent = text.slice(match[0].length)
+    li.setAttribute('data-type', 'taskItem')
+    li.setAttribute('data-checked', (match[1] ?? '').toLowerCase() === 'x' ? 'true' : 'false')
+    li.parentElement?.setAttribute('data-type', 'taskList')
+  }
+
+  return root.innerHTML
+}
+
+export function markdownToHtml(markdown: string): string {
+  if (!markdown) return ''
+  return enhanceMarkdownHtml(markdownIt.render(preprocessMarkdown(markdown)))
+}
+
+function serializeNamedMention(prefix: '&session' | '&todo' | '&calendar_event', id: string, label: string | null): string {
+  return label ? `${prefix}:${id}::${encodeURIComponent(label)}` : `${prefix}:${id}`
+}
+
+function addMentionBoundary(serialized: string, element: HTMLElement): string {
+  const nextText = element.nextSibling?.textContent ?? ''
+  return nextText.length > 0 && !/^\s/u.test(nextText) ? `${serialized} ` : serialized
+}
+
+/** 将 TipTap 输出的 HTML 转换为 Markdown 格式 */
+export function htmlToMarkdown(
+  html: string,
+  options?: { skipMarkdownEscape?: boolean; paragraphSeparator?: string },
+): string {
+  if (!html || html === '<p></p>') return ''
+
+  const div = document.createElement('div')
+  div.innerHTML = html
+
+  function processNode(node: Node, context: 'normal' | 'code' = 'normal'): string {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent || ''
+      if (context === 'code' || options?.skipMarkdownEscape) return text
+      return escapeMarkdownText(text)
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return ''
+    }
+
+    const el = node as HTMLElement
+    const tagName = el.tagName.toLowerCase()
+    const childContext = tagName === 'pre' || tagName === 'code' ? 'code' : 'normal'
+    const children = Array.from(el.childNodes).map((child) => processNode(child, childContext)).join('')
+
+    switch (tagName) {
+      case 'div':
+        if (el.getAttribute('data-type') === 'raw-html-block') {
+          const htmlMarkdown = el.getAttribute('data-markdown')
+          if (htmlMarkdown !== null) return `${htmlMarkdown}\n`
+
+          return `${el.getAttribute('data-html') || ''}\n`
+        }
+        if (el.getAttribute('data-type') === 'math-block') {
+          return `$$\n${el.getAttribute('data-latex') || ''}\n$$\n`
+        }
+        return children
+      case 'img': {
+        const src = el.getAttribute('src') || ''
+        const alt = el.getAttribute('alt') || ''
+        const title = el.getAttribute('title') || ''
+        const width = parseImageWidth(el.getAttribute('width'))
+        if (width) {
+          return `<img src="${escapeAttr(src)}" alt="${escapeAttr(alt)}" width="${width}"${title ? ` title="${escapeAttr(title)}"` : ''}>\n\n`
+        }
+        return `![${escapeMarkdownText(alt)}](${escapeMarkdownLinkTarget(src)}${title ? ` "${title.replace(/"/g, '\\"')}"` : ''})\n\n`
+      }
+      case 'video': {
+        const src = el.getAttribute('src') || el.querySelector('source')?.getAttribute('src') || ''
+        const title = el.getAttribute('title') || ''
+        return `<video controls src="${escapeAttr(src)}"${title ? ` title="${escapeAttr(title)}"` : ''}></video>\n`
+      }
+      case 'p':
+        return children + (options?.paragraphSeparator ?? '\n\n')
+      case 'br':
+        return '\n'
+      case 'strong':
+      case 'b':
+        return `**${children}**`
+      case 'em':
+      case 'i':
+        return `*${children}*`
+      case 'u':
+        return `<u>${children}</u>`
+      case 's':
+      case 'strike':
+      case 'del':
+        return `~~${children}~~`
+      case 'code':
+        if (el.parentElement?.tagName.toLowerCase() === 'pre') {
+          return children
+        }
+        return serializeInlineCode(children)
+      case 'pre': {
+        const codeEl = el.querySelector('code')
+        const langClass = codeEl?.className || ''
+        const langMatch = langClass.match(/language-(\S+)/)
+        const lang = langMatch ? langMatch[1] : ''
+        const codeContent = codeEl ? extractCodeText(codeEl) : children
+        return `\`\`\`${lang}\n${codeContent}\n\`\`\`\n`
+      }
+      case 'a': {
+        const href = el.getAttribute('href') || ''
+        return `[${children}](${escapeMarkdownLinkTarget(href)})`
+      }
+      case 'ul':
+        if (el.getAttribute('data-type') === 'taskList') {
+          return Array.from(el.children)
+            .map((li) => {
+              const checked = li.getAttribute('data-checked') === 'true' ? 'x' : ' '
+              return `- [${checked}] ${processNode(li).trim()}`
+            })
+            .join('\n') + '\n'
+        }
+        return Array.from(el.children)
+          .map((li) => `- ${processNode(li).trim()}`)
+          .join('\n') + '\n'
+      case 'ol':
+        return Array.from(el.children)
+          .map((li, i) => `${i + 1}. ${processNode(li).trim()}`)
+          .join('\n') + '\n'
+      case 'li':
+        return children
+      case 'table': {
+        const rows = Array.from(el.querySelectorAll('tr')).map((row) =>
+          Array.from(row.children).map((cell) => processNode(cell).trim().replace(/\n+/g, ' '))
+        ).filter((row) => row.length > 0)
+        if (rows.length === 0) return ''
+        const columnCount = Math.max(...rows.map((row) => row.length))
+        const normalize = (row: string[]) => Array.from({ length: columnCount }, (_, i) => row[i] ?? '')
+        const [head, ...body] = rows.map(normalize)
+        if (!head) return ''
+        return [
+          `| ${head.join(' | ')} |`,
+          `| ${head.map(() => '---').join(' | ')} |`,
+          ...body.map((row) => `| ${row.join(' | ')} |`),
+        ].join('\n') + '\n'
+      }
+      case 'th':
+      case 'td':
+        return children
+      case 'blockquote':
+        return children
+          .replace(/\n+$/, '')
+          .split('\n')
+          .map((line) => `> ${line}`)
+          .join('\n') + '\n'
+      case 'h1': return `# ${children}\n`
+      case 'h2': return `## ${children}\n`
+      case 'h3': return `### ${children}\n`
+      case 'h4': return `#### ${children}\n`
+      case 'h5': return `##### ${children}\n`
+      case 'h6': return `###### ${children}\n`
+      case 'hr': return '---\n'
+      case 'span': {
+        if (el.getAttribute('data-type') === 'raw-html-inline') {
+          return el.getAttribute('data-html') || ''
+        }
+        if (el.getAttribute('data-type') === 'math-inline') {
+          return `$${el.getAttribute('data-latex') || ''}$`
+        }
+        const dataType = el.getAttribute('data-type')
+        const dataId = el.getAttribute('data-id') || ''
+        const dataLabel = el.getAttribute('data-label')
+        const suggestionChar = el.getAttribute('data-mention-suggestion-char') || '@'
+        const referenceType = el.getAttribute('data-mention-reference-type')
+        const agentHistoryQuote = el.getAttribute('data-mention-quote')
+        if (dataType === 'mention') {
+          let serializedMention: string
+          if (agentHistoryQuote) serializedMention = `&quote:${agentHistoryQuote}`
+          else if (referenceType === 'todo') serializedMention = serializeNamedMention('&todo', dataId, dataLabel)
+          else if (referenceType === 'calendar_event') serializedMention = serializeNamedMention('&calendar_event', dataId, dataLabel)
+          else if (suggestionChar === '/') serializedMention = `/skill:${dataId}`
+          else if (suggestionChar === '#') serializedMention = `#mcp:${dataId}`
+          else if (suggestionChar === '&') serializedMention = serializeNamedMention('&session', dataId, dataLabel)
+          else {
+            // 路径可能包含空格等字符，必须编码后再嵌入 @file: 协议；
+            // 展示层和排队消息解析器会在显式空格或紧邻的 CJK 文本处结束 token；
+            // 序列化层会为未分隔的后续文本补充空格，避免 ASCII 后缀被吞进 chip。
+            serializedMention = `@file:${encodeURIComponent(dataId)}`
+          }
+          return addMentionBoundary(serializedMention, el)
+        }
+        return children
+      }
+      default: return children
+    }
+  }
+
+  return processNode(div).trim()
+}
+
+/**
+ * 将编辑器选区导出为系统剪贴板的纯文本。
+ *
+ * Markdown 持久化需要用空行区分段落；普通剪贴板文本只需要单个换行。
+ * 这个专用出口避免把 Markdown 的段落分隔符带入其他编辑器，同时保留
+ * 选区内显式空段落和全部内联 Markdown 语义。
+ */
+export function htmlToClipboardText(html: string, options?: { skipMarkdownEscape?: boolean }): string {
+  return htmlToMarkdown(html, {
+    ...options,
+    paragraphSeparator: '\n',
+  }).replace(/\r\n?/g, '\n')
+}

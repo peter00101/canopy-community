@@ -1,0 +1,24 @@
+{
+  "name": "@canopy/business-automation",
+  "version": "0.1.1",
+  "license": "AGPL-3.0-only",
+  "description": "Canopy 定时任务（Automation）业务层：CRUD、调度 tick、运行通知，只通过接口注入依赖内核与 Electron 基础设施",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@canopy/brand": "workspace:*",
+    "@canopy/kernel": "workspace:*",
+    "@canopy/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

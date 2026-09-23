@@ -1,0 +1,389 @@
+/**
+ * useAgentSkillsData — Agent 技能视图的数据层
+ *
+ * 封装当前工作区 Skills / MCP 的加载与增删改逻辑（IPC 调用），
+ * 供「Agent 技能」全屏视图复用。当前 Skills 页面挂载期间固定初始快照，
+ * 避免文件监听导致的重排和整页跳动；开关仅更新对应卡片的 enabled 字段。
+ * 只读浏览不会验证或写回 MCP 配置，离开后下次进入或切换工作区时再重新读取完整能力列表。
+ */
+
+import * as React from 'react'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { toast } from 'sonner'
+import {
+  agentWorkspacesAtom,
+  currentAgentWorkspaceIdAtom,
+  workspaceCapabilitiesVersionAtom,
+} from '@/atoms/agent-atoms'
+import type { BuiltinMcpServerSummary, CliIntegrationStatus, McpServerEntry, SkillMeta, WorkspaceCapabilities, WorkspaceMcpConfig } from '@canopy/shared'
+import type { CatalogCliProbeState } from './integration-catalog'
+
+const CLI_STATUS_CACHE_TTL_MS = 5 * 60 * 1000
+const cliIntegrationStatusCache = new Map<string, { statuses: CliIntegrationStatus[]; cachedAt: number }>()
+const cliIntegrationStatusRequests = new Map<string, Promise<CliIntegrationStatus[]>>()
+
+/** Reuse recent probes for a short period so revisiting a workspace does not flash through loading. */
+function probeCliIntegrationStatuses(workspaceSlug: string): Promise<CliIntegrationStatus[]> {
+  const cached = cliIntegrationStatusCache.get(workspaceSlug)
+  if (cached && Date.now() - cached.cachedAt < CLI_STATUS_CACHE_TTL_MS) return Promise.resolve(cached.statuses)
+
+  const inFlight = cliIntegrationStatusRequests.get(workspaceSlug)
+  if (inFlight) return inFlight
+
+  const request = Promise.resolve().then(() => window.electronAPI.getCliIntegrationStatuses(workspaceSlug))
+  cliIntegrationStatusRequests.set(workspaceSlug, request)
+  void request.then((statuses) => {
+    cliIntegrationStatusCache.set(workspaceSlug, { statuses, cachedAt: Date.now() })
+    if (cliIntegrationStatusRequests.get(workspaceSlug) === request) cliIntegrationStatusRequests.delete(workspaceSlug)
+  }, () => {
+    if (cliIntegrationStatusRequests.get(workspaceSlug) === request) cliIntegrationStatusRequests.delete(workspaceSlug)
+  })
+  return request
+}
+
+export interface AgentSkillsData {
+  /** 当前工作区（未选中时为 null） */
+  workspaceSlug: string
+  workspaceName: string
+  hasWorkspace: boolean
+  loading: boolean
+  /** 当前 skills 快照实际读取自的工作区；切换期间用于避免使用旧数据渲染详情。 */
+  loadedWorkspaceSlug: string
+  skills: SkillMeta[]
+  defaultSkillSlugs: Set<string>
+  skillsDir: string
+  mcpConfig: WorkspaceMcpConfig
+  capabilities: WorkspaceCapabilities | null
+  /** 每次从磁盘重新读取 Skills 后递增，供详情页刷新 SKILL.md 正文。 */
+  skillsRevision: number
+  builtinMcpServers: BuiltinMcpServerSummary[]
+  cliIntegrationStatuses: CliIntegrationStatus[]
+  cliIntegrationProbeState: CatalogCliProbeState
+  updatingSkill: string | null
+  setCliIntegrationEnabled: (id: string, enabled: boolean) => Promise<void>
+  toggleSkill: (slug: string, enabled: boolean) => Promise<void>
+  deleteSkill: (slug: string, name: string) => Promise<boolean>
+  updateSkill: (slug: string) => Promise<void>
+  refreshMcpConfig: () => Promise<void>
+  toggleMcp: (name: string, enabled: boolean) => Promise<{ success: boolean; message: string }>
+  installMcp: (name: string, entry: McpServerEntry) => Promise<boolean>
+  toggleBuiltinMcp: (id: string, enabled: boolean) => Promise<void>
+  deleteMcp: (name: string) => Promise<void>
+}
+
+/**
+ * workspaceId 指定时用于右侧 Component Workspace：数据归属必须锁定到宿主 Agent
+ * 会话的项目，不能跟随全局项目选择器切换。
+ */
+export function useAgentSkillsData(workspaceId?: string): AgentSkillsData {
+  const workspaces = useAtomValue(agentWorkspacesAtom)
+  const selectedWorkspaceId = useAtomValue(currentAgentWorkspaceIdAtom)
+  const capabilitiesVersion = useAtomValue(workspaceCapabilitiesVersionAtom)
+  const bumpCapabilitiesVersion = useSetAtom(workspaceCapabilitiesVersionAtom)
+
+  const currentWorkspace = workspaces.find((w) => w.id === (workspaceId ?? selectedWorkspaceId))
+  const workspaceSlug = currentWorkspace?.slug ?? ''
+
+  const [loading, setLoading] = React.useState(true)
+  const [loadedWorkspaceSlug, setLoadedWorkspaceSlug] = React.useState('')
+  const [skills, setSkills] = React.useState<SkillMeta[]>([])
+  const [defaultSkillSlugs, setDefaultSkillSlugs] = React.useState<Set<string>>(new Set())
+  const [skillsDir, setSkillsDir] = React.useState('')
+  const [mcpConfig, setMcpConfig] = React.useState<WorkspaceMcpConfig>({ servers: {} })
+  const [capabilities, setCapabilities] = React.useState<WorkspaceCapabilities | null>(null)
+  const [skillsRevision, setSkillsRevision] = React.useState(0)
+  const [builtinMcpServers, setBuiltinMcpServers] = React.useState<BuiltinMcpServerSummary[]>([])
+  const [cliIntegrationStatuses, setCliIntegrationStatuses] = React.useState<CliIntegrationStatus[]>([])
+  const [cliIntegrationProbeState, setCliIntegrationProbeState] = React.useState<CatalogCliProbeState>('loading')
+  const [updatingSkill, setUpdatingSkill] = React.useState<string | null>(null)
+  const loadRequestRef = React.useRef(0)
+  const cliProbeRequestRef = React.useRef(0)
+  /** 用户最近一次开关意图覆盖验证期间写入磁盘的临时 disabled 状态。 */
+  const mcpToggleIntentsRef = React.useRef(new Map<string, boolean>())
+  /** 使验证期间已发起的 watcher 重读不能在完成后写回旧快照。 */
+  const mcpConfigMutationRevisionRef = React.useRef(0)
+  const observedCapabilitiesVersionRef = React.useRef(capabilitiesVersion)
+
+  const loadData = React.useCallback(async () => {
+    const requestId = ++loadRequestRef.current
+    const mcpConfigMutationRevision = mcpConfigMutationRevisionRef.current
+    if (!workspaceSlug) {
+      setSkills([])
+      setMcpConfig({ servers: {} })
+      setCapabilities(null)
+      setBuiltinMcpServers([])
+      setCliIntegrationStatuses([])
+      setCliIntegrationProbeState('ready')
+      setLoadedWorkspaceSlug(workspaceSlug)
+      setLoading(false)
+      return
+    }
+    try {
+      // CLI authentication checks can spawn several local commands and are intentionally
+      // excluded from this first render-critical batch.
+      const [config, skillList, dir, defaultSlugs, capabilities] = await Promise.all([
+        window.electronAPI.getWorkspaceMcpConfig(workspaceSlug),
+        window.electronAPI.getWorkspaceSkills(workspaceSlug),
+        window.electronAPI.getWorkspaceSkillsDir(workspaceSlug),
+        window.electronAPI.getDefaultSkillSlugs(),
+        window.electronAPI.getWorkspaceCapabilities(workspaceSlug),
+      ])
+      if (loadRequestRef.current !== requestId) return
+      setMcpConfig((current) => {
+        // 启用时主进程会短暂地把 mcp.json 写成 disabled，等待握手成功后再回写；
+        // watcher 在这个窗口读到的中间态不能让乐观开关“打开→关闭→打开”。
+        if (mcpConfigMutationRevisionRef.current !== mcpConfigMutationRevision) return current
+        const servers = { ...config.servers }
+        for (const [name, enabled] of mcpToggleIntentsRef.current) {
+          const entry = servers[name]
+          if (entry) servers[name] = { ...entry, enabled }
+        }
+        return { servers }
+      })
+      setSkills(skillList)
+      setSkillsDir(dir)
+      setDefaultSkillSlugs(new Set(defaultSlugs))
+      setCapabilities(capabilities)
+      setSkillsRevision((version) => version + 1)
+      setBuiltinMcpServers(capabilities.builtinMcpServers)
+      const cachedCliStatuses = cliIntegrationStatusCache.get(workspaceSlug)
+      const hasFreshCliCache = cachedCliStatuses && Date.now() - cachedCliStatuses.cachedAt < CLI_STATUS_CACHE_TTL_MS
+      setLoadedWorkspaceSlug(workspaceSlug)
+      setCliIntegrationProbeState(hasFreshCliCache ? 'ready' : 'loading')
+      setCliIntegrationStatuses(cachedCliStatuses?.statuses ?? [])
+      setLoading(false)
+
+      const cliProbeRequestId = ++cliProbeRequestRef.current
+      void probeCliIntegrationStatuses(workspaceSlug)
+        .then((statuses) => {
+          if (loadRequestRef.current !== requestId || cliProbeRequestRef.current !== cliProbeRequestId) return
+          setCliIntegrationStatuses(statuses)
+          cliIntegrationStatusCache.set(workspaceSlug, { statuses, cachedAt: Date.now() })
+          setCliIntegrationProbeState('ready')
+        })
+        .catch((error) => {
+          if (loadRequestRef.current !== requestId || cliProbeRequestRef.current !== cliProbeRequestId) return
+          console.warn('[Agent 技能] 后台检测 CLI 集成状态失败:', error)
+          setCliIntegrationProbeState('failed')
+        })
+
+    } catch (error) {
+      if (loadRequestRef.current !== requestId) return
+      console.error('[Agent 技能] 加载工作区配置失败:', error)
+      setLoading(false)
+    }
+  }, [workspaceSlug])
+
+  // 首次进入或切换工作区时展示加载态；普通文件监听刷新则保留当前视图，避免闪烁。
+  React.useEffect(() => {
+    setLoading(true)
+    void loadData()
+    return () => { ++cliProbeRequestRef.current }
+  }, [loadData])
+
+  // 外部 Agent 或其他进程编辑 Skills 后，主进程 watcher 会以 300ms debounce 推送
+  // capabilitiesVersion。这里仅重新读取当前工作区的数据，不触发加载占位或 CLI 重探测。
+  React.useEffect(() => {
+    if (observedCapabilitiesVersionRef.current === capabilitiesVersion) return
+    observedCapabilitiesVersionRef.current = capabilitiesVersion
+    void loadData()
+  }, [capabilitiesVersion, loadData])
+
+  const setCliIntegrationEnabled = React.useCallback(async (id: string, enabled: boolean): Promise<void> => {
+    const cliProbeRequestId = ++cliProbeRequestRef.current
+    try {
+      const statuses = await window.electronAPI.setCliIntegrationEnabled(workspaceSlug, id, enabled)
+      if (cliProbeRequestRef.current !== cliProbeRequestId) return
+      setCliIntegrationStatuses(statuses)
+      cliIntegrationStatusCache.set(workspaceSlug, { statuses, cachedAt: Date.now() })
+      setCliIntegrationProbeState('ready')
+    } catch (error) {
+      if (cliProbeRequestRef.current === cliProbeRequestId) setCliIntegrationProbeState('failed')
+      console.error('[Agent 技能] 切换 CLI 集成状态失败:', error)
+      throw error
+    }
+  }, [workspaceSlug])
+
+  const toggleSkill = React.useCallback(async (slug: string, enabled: boolean) => {
+    try {
+      await window.electronAPI.toggleWorkspaceSkill(workspaceSlug, slug, enabled)
+      setSkills((prev) => prev.map((s) => (s.slug === slug ? { ...s, enabled } : s)))
+    } catch (error) {
+      console.error('[Agent 技能] 切换 Skill 状态失败:', error)
+      toast.error('切换 Skill 状态失败')
+    }
+  }, [workspaceSlug])
+
+  const deleteSkill = React.useCallback(async (slug: string, name: string): Promise<boolean> => {
+    try {
+      await window.electronAPI.deleteWorkspaceSkill(workspaceSlug, slug)
+      setSkills((prev) => prev.filter((s) => s.slug !== slug))
+      bumpCapabilitiesVersion((v) => v + 1)
+      toast.success(`已删除 Skill：${name}`)
+      return true
+    } catch (error) {
+      console.error('[Agent 技能] 删除 Skill 失败:', error)
+      toast.error('删除 Skill 失败')
+      return false
+    }
+  }, [workspaceSlug, bumpCapabilitiesVersion])
+
+  const updateSkill = React.useCallback(async (slug: string) => {
+    if (!workspaceSlug || updatingSkill) return
+    setUpdatingSkill(slug)
+    try {
+      const updated = await window.electronAPI.updateSkillFromSource(workspaceSlug, slug)
+      setSkills((prev) => prev.map((s) => (s.slug === slug ? updated : s)))
+      bumpCapabilitiesVersion((v) => v + 1)
+      toast.success(`已同步更新 Skill：${updated.name}`)
+    } catch (error) {
+      console.error('[Agent 技能] 更新 Skill 失败:', error)
+      const message = error instanceof Error ? error.message : '未知错误'
+      toast.error('更新 Skill 失败', { description: message })
+    } finally {
+      setUpdatingSkill(null)
+    }
+  }, [workspaceSlug, updatingSkill, bumpCapabilitiesVersion])
+
+  const refreshMcpConfig = React.useCallback(async () => {
+    if (!workspaceSlug) return
+    try {
+      const config = await window.electronAPI.getWorkspaceMcpConfig(workspaceSlug)
+      setMcpConfig(config)
+    } catch (error) {
+      console.error('[Agent 技能] 刷新 MCP 配置失败:', error)
+    }
+  }, [workspaceSlug])
+
+  const mcpToggleRequestRef = React.useRef(new Map<string, number>())
+  const toggleMcp = React.useCallback(async (name: string, enabled: boolean): Promise<{ success: boolean; message: string }> => {
+    const requestId = (mcpToggleRequestRef.current.get(name) ?? 0) + 1
+    mcpToggleRequestRef.current.set(name, requestId)
+    mcpToggleIntentsRef.current.set(name, enabled)
+
+    // 乐观更新：开关先响应用户操作；启用时主进程仍会在后台完成握手验证，
+    // 失败后再由真实结果把状态回滚。快速连续切换时只接受最后一次请求的结果。
+    setMcpConfig((current) => {
+      const entry = current.servers[name]
+      if (!entry) return current
+      return { ...current, servers: { ...current.servers, [name]: { ...entry, enabled } } }
+    })
+
+    try {
+      const result = await window.electronAPI.setMcpEnabledAndValidate(workspaceSlug, name, enabled)
+      if (mcpToggleRequestRef.current.get(name) !== requestId) return result.verification
+
+      mcpConfigMutationRevisionRef.current += 1
+      mcpToggleIntentsRef.current.delete(name)
+      // 只合并目标服务器，避免后台验证返回的旧快照覆盖其他卡片的最新编辑。
+      const nextEntry = result.config.servers[name]
+      if (nextEntry) {
+        setMcpConfig((current) => ({
+          ...current,
+          servers: { ...current.servers, [name]: nextEntry },
+        }))
+      }
+      bumpCapabilitiesVersion((v) => v + 1)
+      if (!result.verification.success && enabled) {
+        setMcpConfig((current) => {
+          const entry = current.servers[name]
+          if (!entry) return current
+          return { ...current, servers: { ...current.servers, [name]: { ...entry, enabled: false } } }
+        })
+        toast.error(`${name} 启用失败`, { description: result.verification.message })
+      }
+      return result.verification
+    } catch (error) {
+      if (mcpToggleRequestRef.current.get(name) === requestId) {
+        mcpConfigMutationRevisionRef.current += 1
+        mcpToggleIntentsRef.current.delete(name)
+        setMcpConfig((current) => {
+          const entry = current.servers[name]
+          if (!entry) return current
+          return { ...current, servers: { ...current.servers, [name]: { ...entry, enabled: !enabled } } }
+        })
+        toast.error('切换 MCP 状态失败')
+      }
+      console.error('[Agent 技能] 切换 MCP 服务器状态失败:', error)
+      return { success: false, message: error instanceof Error ? error.message : '切换 MCP 状态失败' }
+    }
+  }, [workspaceSlug, bumpCapabilitiesVersion])
+
+  const installMcp = React.useCallback(async (name: string, entry: McpServerEntry): Promise<boolean> => {
+    try {
+      // Do not build a whole config from renderer state: concurrent installs or
+      // edits are resolved against the latest main-process snapshot instead.
+      const result = await window.electronAPI.installMcpAndValidate(workspaceSlug, name, entry)
+      setMcpConfig(result.config)
+      if (result.installed) bumpCapabilitiesVersion((v) => v + 1)
+      return result.installed
+    } catch (error) {
+      console.error('[Agent 技能] 安装 MCP 失败:', error)
+      toast.error('安装 MCP 失败')
+      return false
+    }
+  }, [workspaceSlug, bumpCapabilitiesVersion])
+
+  const toggleBuiltinMcp = React.useCallback(async (id: string, enabled: boolean) => {
+    try {
+      const capabilities = await window.electronAPI.setBuiltinMcpEnabled(workspaceSlug, id, enabled)
+      setCapabilities(capabilities)
+      setBuiltinMcpServers(capabilities.builtinMcpServers)
+      bumpCapabilitiesVersion((v) => v + 1)
+      toast.success(enabled ? '已启用内置 MCP' : '已关闭内置 MCP')
+    } catch (error) {
+      console.error('[Agent 技能] 切换内置 MCP 状态失败:', error)
+      toast.error('切换内置 MCP 状态失败')
+    }
+  }, [workspaceSlug, bumpCapabilitiesVersion])
+
+  const deleteMcp = React.useCallback(async (name: string) => {
+    const entry = mcpConfig.servers[name]
+    if (entry?.isBuiltin) return
+    try {
+      // Delete against the main-process snapshot so unrelated enabled MCPs are
+      // neither overwritten by this renderer snapshot nor re-validated.
+      const newConfig = await window.electronAPI.deleteWorkspaceMcp(workspaceSlug, name)
+      setMcpConfig(newConfig)
+      bumpCapabilitiesVersion((v) => v + 1)
+      try {
+        await window.electronAPI.deleteMcpCredential(workspaceSlug, name)
+      } catch (error) {
+        console.error('[Agent 技能] MCP 配置已删除，但安全凭据清理失败:', error)
+        toast.warning('MCP 配置已删除，但安全凭据清理失败')
+        return
+      }
+      toast.success(`已删除 MCP 服务器：${name}`)
+    } catch (error) {
+      console.error('[Agent 技能] 删除 MCP 服务器失败:', error)
+      toast.error('删除 MCP 服务器失败')
+    }
+  }, [workspaceSlug, mcpConfig, bumpCapabilitiesVersion])
+
+  return {
+    workspaceSlug,
+    workspaceName: currentWorkspace?.name ?? '',
+    hasWorkspace: !!currentWorkspace,
+    loading,
+    loadedWorkspaceSlug,
+    skills,
+    defaultSkillSlugs,
+    skillsDir,
+    mcpConfig,
+    capabilities,
+    skillsRevision,
+    builtinMcpServers,
+    cliIntegrationStatuses,
+    cliIntegrationProbeState,
+    updatingSkill,
+    setCliIntegrationEnabled,
+    toggleSkill,
+    deleteSkill,
+    updateSkill,
+    refreshMcpConfig,
+    toggleMcp,
+    installMcp,
+    toggleBuiltinMcp,
+    deleteMcp,
+  }
+}

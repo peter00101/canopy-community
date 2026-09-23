@@ -1,0 +1,48 @@
+Canopy Community
+Copyright (C) 2026 Canopy Community contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3. See the LICENSE file for the full text.
+
+------------------------------------------------------------------------------
+Origin
+
+Canopy Community is a modified version of Proma
+(https://github.com/proma-ai/Proma), which is licensed under the GNU Affero
+General Public License v3.0. Copyright in the original work remains with the
+Proma authors.
+
+------------------------------------------------------------------------------
+Modifications (2026)
+
+Notable changes relative to Proma include:
+
+- Renamed the product and its identifiers; separate application id and data
+  directory (~/.canopy-community/).
+- Restructured the agent layer into a runtime-agnostic kernel
+  (packages/kernel), a Pi runtime plugin (packages/runtime-pi) and business
+  packages for automation and IM bridges.
+- Added built-in Office document tools based on OfficeCLI, legacy .doc / .xls
+  / .ppt reading, PSD reading / composing / editing, and the canopy-ppt and
+  canopy-psd skills.
+- Extended file previews: lazily rendered and searchable PDF, virtualized large
+  spreadsheets, legacy Office formats, editable Markdown tables, math, outline.
+- Reworked plan approval, terminal output flow control, run persistence and
+  recovery, focus handling of the side panel, and many UI details (layout
+  scale, color themes, title bar).
+- Removed automatic updates and the in-app release channel.
+
+The complete history of changes in this repository is available in its git log.
+
+------------------------------------------------------------------------------
+Third-party components
+
+The agent runtime is built on Pi (https://github.com/earendil-works/pi), MIT.
+Third-party components keep their own licenses:
+- OfficeCLI (https://github.com/iOfficeAI/OfficeCLI), Apache-2.0. Not stored
+  in this repository; the build downloads a pinned release and verifies its
+  SHA-256 before bundling it.
+- guizang-ppt-skill, MIT; skill-creator, Apache-2.0 (license files are in
+  their skill directories).
+- UI sound effects and illustrations, CC0 1.0.

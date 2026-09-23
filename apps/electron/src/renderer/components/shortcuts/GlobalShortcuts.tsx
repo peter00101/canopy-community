@@ -1,0 +1,566 @@
+/**
+ * GlobalShortcuts — 全局快捷键注册 + 初始化组件
+ *
+ * 在 main.tsx 顶层挂载（类似 AgentListenersInitializer），永不销毁。
+ * 负责：
+ * 1. 初始化快捷键注册表
+ * 2. 从 settings 加载用户自定义配置
+ * 3. 注册所有应用级快捷键的 handler
+ * 4. 监听菜单 IPC 事件（Cmd+W 关闭标签）
+ */
+
+import { useEffect, useCallback } from 'react'
+import { useAtomValue, useSetAtom, useAtom, useStore } from 'jotai'
+import { appModeAtom } from '@/atoms/app-mode'
+import { settingsOpenAtom, channelFormDirtyAtom, settingsCloseRequestedAtom } from '@/atoms/settings-tab'
+import { searchDialogOpenAtom } from '@/atoms/search-atoms'
+import {
+  tabsAtom,
+  activeTabIdAtom,
+  activeTabAtom,
+  sidebarCollapsedAtom,
+  openTab,
+} from '@/atoms/tab-atoms'
+import { shortcutOverridesAtom, sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
+import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
+import {
+  agentPendingPromptAtom,
+  agentSessionDraftHtmlAtom,
+  agentSessionDraftsAtom,
+  agentSessionDraftSyncVersionsAtom,
+  agentSessionsAtom,
+  currentAgentSessionIdAtom,
+  agentChannelIdAtom,
+  agentModelIdAtom,
+  currentAgentWorkspaceIdAtom,
+  agentWorkspacesAtom,
+  agentAttachedFilesMapAtom,
+  agentDiffPanelTabAtom,
+  agentSideDelegationMapAtom,
+  agentSidePanelSplitMapAtom,
+  currentSessionSidePanelOpenAtom,
+  isWorkspaceComponentTab,
+} from '@/atoms/agent-atoms'
+import {
+  chatPendingMessageAtom,
+  conversationDraftsAtom,
+  conversationDraftSyncVersionsAtom,
+  conversationsAtom,
+  currentConversationIdAtom,
+  selectedModelAtom,
+} from '@/atoms/chat-atoms'
+import { activeViewAtom } from '@/atoms/active-view'
+import { useCreateSession } from '@/hooks/useCreateSession'
+import { useShortcut } from '@/hooks/useShortcut'
+import { useCloseTab } from '@/hooks/useCloseTab'
+import {
+  initShortcutRegistry,
+  updateShortcutOverrides,
+} from '@/lib/shortcut-registry'
+import { getFileParentPath } from '@/lib/file-utils'
+import { isDelegationObservationVisible } from '@/lib/agent-session-list'
+import { getLastInteractedStopTarget, resolveStopGenerationTarget } from '@/lib/stop-generation-target'
+import { CLOSE_ACTIVE_RIGHT_WORKSPACE_TAB_EVENT } from '@/lib/right-workspace-events'
+import {
+  shouldFallbackVoiceDictationToActiveTab,
+  VOICE_DICTATION_CLEAR_PREVIEW_EVENT,
+  VOICE_DICTATION_PREVIEW_EVENT,
+} from '@/lib/voice-input-focus'
+
+/**
+ * 快捷键初始化 + 全局 Handler 注册
+ *
+ * 挂载后从 settings 加载自定义配置，并注册所有应用级快捷键。
+ */
+export function GlobalShortcuts(): null {
+  const [appMode, setAppMode] = useAtom(appModeAtom)
+  const [settingsOpen, setSettingsOpen] = useAtom(settingsOpenAtom)
+  const channelFormDirty = useAtomValue(channelFormDirtyAtom)
+  const setSettingsCloseRequested = useSetAtom(settingsCloseRequestedAtom)
+  const [searchOpen, setSearchOpen] = useAtom(searchDialogOpenAtom)
+  const [shortcutGuideOpen, setShortcutGuideOpen] = useAtom(shortcutGuideOpenAtom)
+  const [sidebarCollapsed, setSidebarCollapsed] = useAtom(sidebarCollapsedAtom)
+  const setShortcutOverrides = useSetAtom(shortcutOverridesAtom)
+  const shortcutOverrides = useAtomValue(shortcutOverridesAtom)
+  const setSendWithCmdEnter = useSetAtom(sendWithCmdEnterAtom)
+  const { createChat, createAgent } = useCreateSession()
+
+  // Tab 管理（用于关闭标签页）
+  const activeTabId = useAtomValue(activeTabIdAtom)
+  const activeTab = useAtomValue(activeTabAtom)
+  const activeAgentSidePanelTab = useAtomValue(agentDiffPanelTabAtom).get(activeTab?.type === 'agent' ? activeTab.sessionId : '')
+  const activeAgentSessionId = activeTab?.type === 'agent' ? activeTab.sessionId : ''
+  const activeDelegationSessionId = useAtomValue(agentSideDelegationMapAtom).get(activeAgentSessionId) ?? null
+  const activeAgentSidePanelSplit = useAtomValue(agentSidePanelSplitMapAtom).get(activeAgentSessionId) ?? null
+  const isActiveAgentSidePanelOpen = useAtomValue(currentSessionSidePanelOpenAtom)
+  const agentSessions = useAtomValue(agentSessionsAtom)
+
+  // 统一关闭逻辑：与 TabBar.handleClose 共用
+  // 含 Agent 子进程 stop + 流式中的确认对话框（修复 Issue #357）
+  const { requestClose } = useCloseTab()
+
+  // 初始化：挂载注册表 + 加载用户配置
+  useEffect(() => {
+    initShortcutRegistry()
+
+    window.electronAPI.getSettings().then((settings) => {
+      if (settings.shortcutOverrides) {
+        setShortcutOverrides(settings.shortcutOverrides)
+        updateShortcutOverrides(settings.shortcutOverrides)
+      }
+      setSendWithCmdEnter(settings.sendWithCmdEnter ?? false)
+    }).catch(console.error)
+  }, [setShortcutOverrides, setSendWithCmdEnter])
+
+  // 配置变更时同步到注册表
+  useEffect(() => {
+    updateShortcutOverrides(shortcutOverrides)
+  }, [shortcutOverrides])
+
+  // ===== 关闭标签页逻辑 =====
+
+  const handleCloseTab = useCallback(() => {
+    // 浮窗优先：有浮窗打开时 Cmd+W 先关闭浮窗而非 tab
+    if (shortcutGuideOpen) {
+      setShortcutGuideOpen(false)
+      return
+    }
+    if (settingsOpen) {
+      // 渠道表单有未保存内容时，通知 SettingsPanel 弹出确认对话框
+      if (channelFormDirty) {
+        setSettingsCloseRequested(true)
+        return
+      }
+      setSettingsOpen(false)
+      return
+    }
+    if (searchOpen) {
+      setSearchOpen(false)
+      return
+    }
+
+    if (activeTab?.type === 'agent') {
+      // Agent 会话常驻左侧历史，不再由 Cmd+W 关闭；仅关闭右侧可关闭工作区 Tab。
+      if (
+        isActiveAgentSidePanelOpen
+        && activeAgentSidePanelTab
+        && (isWorkspaceComponentTab(activeAgentSidePanelTab) || activeAgentSidePanelTab.startsWith('preview:') || activeAgentSidePanelTab.startsWith('browser:') || activeAgentSidePanelTab.startsWith('exploration:') || activeAgentSidePanelTab === 'delegation' || activeAgentSidePanelTab.startsWith('terminal:'))
+      ) {
+        window.dispatchEvent(new CustomEvent(CLOSE_ACTIVE_RIGHT_WORKSPACE_TAB_EVENT, {
+          detail: { sessionId: activeTab.sessionId },
+        }))
+      }
+      return
+    }
+
+    if (!activeTabId) return
+    requestClose(activeTabId)
+  }, [shortcutGuideOpen, setShortcutGuideOpen, settingsOpen, setSettingsOpen, channelFormDirty, setSettingsCloseRequested, searchOpen, setSearchOpen, activeTab, activeAgentSidePanelTab, isActiveAgentSidePanelOpen, activeTabId, requestClose])
+
+  // 监听菜单 IPC 事件（Cmd+W 被 Electron 菜单拦截后通过 IPC 转发）
+  useEffect(() => {
+    const cleanup = window.electronAPI.onMenuCloseTab(handleCloseTab)
+    return cleanup
+  }, [handleCloseTab])
+
+  // 同时注册到快捷键系统（用于设置面板展示和自定义，实际触发走 IPC）
+  useShortcut('close-tab', handleCloseTab)
+
+  // ===== 快捷键 Handler =====
+
+  // Cmd+, → 打开设置
+  useShortcut(
+    'open-settings',
+    useCallback(() => setSettingsOpen(true), [setSettingsOpen]),
+  )
+
+  // Cmd+Shift+F / Ctrl+Shift+F → 全局搜索
+  useShortcut(
+    'global-search',
+    useCallback(() => setSearchOpen(true), [setSearchOpen]),
+  )
+
+  // Cmd+N → 新建对话/会话（根据当前模式）
+  useShortcut(
+    'new-session',
+    useCallback(() => {
+      if (appMode === 'agent') {
+        createAgent({ draft: true })
+      } else {
+        createChat({ draft: true })
+      }
+    }, [appMode, createAgent, createChat]),
+  )
+
+  // Cmd+B → 切换侧边栏
+  useShortcut(
+    'toggle-sidebar',
+    useCallback(
+      () => setSidebarCollapsed(!sidebarCollapsed),
+      [sidebarCollapsed, setSidebarCollapsed],
+    ),
+  )
+
+  // Cmd+Shift+M → 切换模式
+  useShortcut(
+    'toggle-mode',
+    useCallback(
+      () => setAppMode(appMode === 'chat' ? 'agent' : 'chat'),
+      [appMode, setAppMode],
+    ),
+  )
+
+  // Cmd+K → 清除上下文（通过 CustomEvent 分发到 ChatInput）
+  useShortcut(
+    'clear-context',
+    useCallback(() => {
+      window.dispatchEvent(new CustomEvent('canopy:clear-context'))
+    }, []),
+  )
+
+  // Cmd+L → 聚焦输入框（通过 CustomEvent 分发到 ChatInput/AgentView）
+  useShortcut(
+    'focus-input',
+    useCallback(() => {
+      window.dispatchEvent(new CustomEvent('canopy:focus-input'))
+    }, []),
+  )
+
+  // Cmd+Shift+Backspace → 停止最近交互的会话。只有 delegated child 需要额外校验，
+  // 因为右侧观察槽会保留挂载状态并替换内容；其他会话沿用原有交互目标语义。
+  useShortcut(
+    'stop-generation',
+    useCallback(() => {
+      const lastTarget = getLastInteractedStopTarget()
+      const lastTargetIsDelegated = lastTarget?.kind === 'agent'
+        && agentSessions.some((session) => session.id === lastTarget.sessionId && !!session.sourceDelegationId)
+      const delegatedTargetVisible = lastTargetIsDelegated
+        && lastTarget.sessionId === activeDelegationSessionId
+        && activeTab?.type === 'agent'
+        && isDelegationObservationVisible(
+          isActiveAgentSidePanelOpen,
+          activeAgentSidePanelTab,
+          activeAgentSidePanelSplit,
+        )
+      const target = lastTarget && (!lastTargetIsDelegated || delegatedTargetVisible)
+        ? lastTarget
+        : resolveStopGenerationTarget(
+            activeTab,
+            isActiveAgentSidePanelOpen ? activeAgentSidePanelTab : undefined,
+            activeDelegationSessionId ? { type: 'agent', sessionId: activeDelegationSessionId } : null,
+          )
+      if (target) {
+        window.dispatchEvent(new CustomEvent('canopy:stop-generation', { detail: target }))
+      }
+    }, [activeAgentSidePanelSplit, activeAgentSidePanelTab, activeDelegationSessionId, activeTab, agentSessions, isActiveAgentSidePanelOpen]),
+  )
+
+  // ===== 快速任务窗口 → 创建会话并自动发送 =====
+
+  const store = useStore()
+
+  useEffect(() => {
+    const cleanup = window.electronAPI.onQuickTaskOpenSession(async (data) => {
+      try {
+        // 切换到对应模式
+        store.set(appModeAtom, data.mode)
+        store.set(activeViewAtom, 'conversations')
+
+        if (data.mode === 'agent') {
+          // Agent 模式：创建会话 + 保存附件到 session 目录
+          const channelId = store.get(agentChannelIdAtom) || undefined
+          const modelId = store.get(agentModelIdAtom) || undefined
+          const workspaceId = store.get(currentAgentWorkspaceIdAtom) || undefined
+          const meta = await window.electronAPI.createAgentSession(
+            undefined,
+            channelId,
+            workspaceId,
+            modelId,
+          )
+          // 更新 atom 状态
+          store.set(agentSessionsAtom, (prev) => [meta, ...prev])
+          store.set(currentAgentSessionIdAtom, meta.id)
+
+          // 处理附件：保存到 session 目录，构建 file references
+          let fileReferences = ''
+          const additionalDirectories = new Set<string>()
+          if (data.files && data.files.length > 0 && workspaceId) {
+            const workspaces = store.get(agentWorkspacesAtom)
+            const workspace = workspaces.find((w) => w.id === workspaceId)
+            if (workspace) {
+              try {
+                const allRefs: Array<{ filename: string; targetPath: string }> = []
+                for (const file of data.files) {
+                  if (!file.sourcePath) continue
+                  const attachedFiles = await window.electronAPI.attachFile({
+                    sessionId: meta.id,
+                    filePath: file.sourcePath,
+                  })
+                  store.set(agentAttachedFilesMapAtom, (prev) => {
+                    const map = new Map(prev)
+                    map.set(meta.id, attachedFiles)
+                    return map
+                  })
+                  allRefs.push({ filename: file.filename, targetPath: file.sourcePath })
+                  const parentPath = getFileParentPath(file.sourcePath)
+                  if (parentPath) additionalDirectories.add(parentPath)
+                }
+
+                const filesToSave = data.files.filter((f) => f.base64).map((f) => ({
+                  filename: f.filename,
+                  data: f.base64!,
+                }))
+                if (filesToSave.length > 0) {
+                  const saved = await window.electronAPI.saveFilesToAgentSession({
+                    workspaceSlug: workspace.slug,
+                    sessionId: meta.id,
+                    files: filesToSave,
+                  })
+                  allRefs.push(...saved)
+                }
+
+                if (allRefs.length > 0) {
+                  const refs = allRefs.map((f) => `- ${f.filename}: ${f.targetPath}`).join('\n')
+                  fileReferences = `<attached_files>\n${refs}\n</attached_files>\n\n`
+                }
+              } catch (error) {
+                console.error('[快速任务] 保存 Agent 附件失败:', error)
+              }
+            }
+          }
+
+          // 打开新标签页
+          const currentTabs = store.get(tabsAtom)
+          const result = openTab(currentTabs, {
+            type: 'agent',
+            sessionId: meta.id,
+            title: data.text.slice(0, 30),
+          })
+          store.set(tabsAtom, result.tabs)
+          store.set(activeTabIdAtom, result.activeTabId)
+
+          // 设置待发送消息（附件引用已内联到消息文本中）
+          store.set(agentPendingPromptAtom, {
+            sessionId: meta.id,
+            message: fileReferences + data.text,
+            ...(additionalDirectories.size > 0 && { additionalDirectories: Array.from(additionalDirectories) }),
+          })
+        } else {
+          // Chat 模式：创建对话 + 保存附件到磁盘
+          const chatModel = store.get(selectedModelAtom)
+          const meta = await window.electronAPI.createConversation(
+            undefined,
+            chatModel?.modelId,
+            chatModel?.channelId,
+          )
+          // 更新 atom 状态
+          store.set(conversationsAtom, (prev) => [meta, ...prev])
+          store.set(currentConversationIdAtom, meta.id)
+
+          // 处理附件：保存到磁盘，收集 FileAttachment[]
+          const savedAttachments: import('@canopy/shared').FileAttachment[] = []
+          if (data.files && data.files.length > 0) {
+            for (const file of data.files) {
+              if (!file.base64) {
+                console.warn('[快速任务] Chat 附件缺少 base64，已跳过:', file.filename)
+                continue
+              }
+              try {
+                const result = await window.electronAPI.saveAttachment({
+                  conversationId: meta.id,
+                  filename: file.filename,
+                  mediaType: file.mediaType,
+                  data: file.base64,
+                })
+                savedAttachments.push(result.attachment)
+              } catch (error) {
+                console.error('[快速任务] 保存 Chat 附件失败:', error)
+              }
+            }
+          }
+
+          // 打开新标签页
+          const currentTabs = store.get(tabsAtom)
+          const tabResult = openTab(currentTabs, {
+            type: 'chat',
+            sessionId: meta.id,
+            title: data.text.slice(0, 30),
+          })
+          store.set(tabsAtom, tabResult.tabs)
+          store.set(activeTabIdAtom, tabResult.activeTabId)
+
+          // 设置待发送消息（含已保存的附件）
+          store.set(chatPendingMessageAtom, {
+            conversationId: meta.id,
+            message: data.text,
+            attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
+          })
+        }
+      } catch (error) {
+        console.error('[快速任务] 创建会话失败:', error)
+      }
+    })
+    return cleanup
+  }, [store])
+
+  // ===== 语音输入 → 写入当前 Canopy 输入框 =====
+
+  useEffect(() => {
+    const cleanupPreview = window.electronAPI.onVoiceDictationPreviewText((data) => {
+      if (!data.text.trim()) return
+      window.dispatchEvent(new CustomEvent(VOICE_DICTATION_PREVIEW_EVENT, { detail: data }))
+    })
+    const cleanupClearPreview = window.electronAPI.onVoiceDictationClearPreviewText((data) => {
+      window.dispatchEvent(new CustomEvent(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, { detail: data }))
+    })
+    const cleanup = window.electronAPI.onVoiceDictationInsertText((data) => {
+      const acknowledgeDelivery = (delivered: boolean): void => {
+        window.electronAPI.acknowledgeVoiceDictationTextDelivery({
+          sessionId: data.sessionId,
+          delivered,
+        })
+      }
+      const trimmed = data.text.trim()
+      if (!trimmed) {
+        acknowledgeDelivery(false)
+        return
+      }
+
+      const insertedAtCursor = !window.dispatchEvent(new CustomEvent('canopy:insert-voice-dictation-text', {
+        cancelable: true,
+        detail: { ...data, text: trimmed },
+      }))
+      if (insertedAtCursor) {
+        acknowledgeDelivery(true)
+        window.dispatchEvent(new CustomEvent('canopy:focus-input'))
+        return
+      }
+
+      if (!shouldFallbackVoiceDictationToActiveTab(data.targetInputId)) {
+        console.warn('[语音输入] 冻结的输入目标已不可用，已丢弃听写结果:', data.targetInputId)
+        acknowledgeDelivery(false)
+        return
+      }
+
+      const tabs = store.get(tabsAtom)
+      const activeTabId = store.get(activeTabIdAtom)
+      const activeTab = tabs.find((tab) => tab.id === activeTabId)
+      const currentMode = store.get(appModeAtom)
+      const fallbackTarget =
+        currentMode === 'agent'
+          ? { type: 'agent' as const, sessionId: store.get(currentAgentSessionIdAtom) }
+          : { type: 'chat' as const, sessionId: store.get(currentConversationIdAtom) }
+      const target = activeTab ?? fallbackTarget
+
+      if (!target.sessionId) {
+        acknowledgeDelivery(false)
+        return
+      }
+
+      store.set(activeViewAtom, 'conversations')
+
+      if (target.type === 'agent' || target.type === 'preview') {
+        const sessionId = target.sessionId
+        store.set(appModeAtom, 'agent')
+        store.set(currentAgentSessionIdAtom, sessionId)
+        store.set(agentSessionDraftsAtom, (prev) => {
+          const map = new Map(prev)
+          const current = map.get(sessionId) ?? ''
+          map.set(sessionId, current ? `${current}\n${trimmed}` : trimmed)
+          return map
+        })
+        store.set(agentSessionDraftHtmlAtom, (prev) => {
+          const map = new Map(prev)
+          map.delete(sessionId)
+          return map
+        })
+        store.set(agentSessionDraftSyncVersionsAtom, (prev) => {
+          const map = new Map(prev)
+          map.set(sessionId, (map.get(sessionId) ?? 0) + 1)
+          return map
+        })
+        window.dispatchEvent(new CustomEvent('canopy:focus-input'))
+        acknowledgeDelivery(true)
+        return
+      }
+
+      if (target.type === 'chat') {
+        const conversationId = target.sessionId
+        store.set(appModeAtom, 'chat')
+        store.set(currentConversationIdAtom, conversationId)
+        store.set(conversationDraftsAtom, (prev) => {
+          const map = new Map(prev)
+          const current = map.get(conversationId) ?? ''
+          map.set(conversationId, current ? `${current}\n${trimmed}` : trimmed)
+          return map
+        })
+        store.set(conversationDraftSyncVersionsAtom, (prev) => {
+          const map = new Map(prev)
+          map.set(conversationId, (map.get(conversationId) ?? 0) + 1)
+          return map
+        })
+        window.dispatchEvent(new CustomEvent('canopy:focus-input'))
+        acknowledgeDelivery(true)
+        return
+      }
+
+      acknowledgeDelivery(false)
+    })
+    return () => {
+      cleanupPreview()
+      cleanupClearPreview()
+      cleanup()
+    }
+  }, [store])
+
+  // ===== 菜单栏 → 打开 / 创建会话 =====
+
+  useEffect(() => {
+    const cleanupOpen = window.electronAPI.onTrayOpenAgentSession(async (data) => {
+      try {
+        const sessions = await window.electronAPI.listAgentSessions()
+        const session = sessions.find((item) => item.id === data.sessionId)
+        if (!session) return
+
+        store.set(agentSessionsAtom, sessions)
+        store.set(appModeAtom, 'agent')
+        store.set(activeViewAtom, 'conversations')
+        store.set(currentAgentSessionIdAtom, session.id)
+
+        if (session.workspaceId) {
+          store.set(currentAgentWorkspaceIdAtom, session.workspaceId)
+          window.electronAPI.updateSettings({
+            agentWorkspaceId: session.workspaceId,
+          }).catch(console.error)
+        }
+
+        const currentTabs = store.get(tabsAtom)
+        const result = openTab(currentTabs, {
+          type: 'agent',
+          sessionId: session.id,
+          title: session.title || data.title,
+        })
+        store.set(tabsAtom, result.tabs)
+        store.set(activeTabIdAtom, result.activeTabId)
+      } catch (error) {
+        console.error('[菜单栏] 打开 Agent 会话失败:', error)
+      }
+    })
+
+    const cleanupCreate = window.electronAPI.onTrayCreateSession(async (data) => {
+      store.set(appModeAtom, data.mode)
+      store.set(activeViewAtom, 'conversations')
+      if (data.mode === 'agent') {
+        await createAgent()
+      } else {
+        await createChat()
+      }
+    })
+
+    return () => {
+      cleanupOpen()
+      cleanupCreate()
+    }
+  }, [store, createAgent, createChat])
+  return null
+}

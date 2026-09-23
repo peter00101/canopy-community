@@ -1,0 +1,19 @@
+{
+  "id": "deep-navy",
+  "name": "深海",
+  "description": "商务稳重：浅灰底、左侧海军蓝色带、右下淡蓝圆。适合经营汇报、方案、投资材料。",
+  "canvas": { "w": 1280, "h": 720 },
+  "background": { "type": "svg", "file": "bg.svg" },
+  "safeArea": { "x": 64, "y": 110, "w": 1176, "h": 560 },
+  "titleBox": { "x": 64, "y": 40, "w": 1000, "h": 60, "fontSize": 36 },
+  "footer": { "text": "{{deck_title}}", "x": 64, "y": 700, "pageNumber": { "x": 1240, "y": 700, "anchor": "end" } },
+  "colors": {
+    "bg": "#F7F9FC", "surface": "#FFFFFF", "text": "#0B2545", "muted": "#6C7A93",
+    "brand": "#0B2545", "accent": "#FFB84D", "line": "#D8E0EA"
+  },
+  "fonts": {
+    "title": "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif",
+    "body": "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif"
+  },
+  "shape": { "radius": 20, "cardStroke": false, "decor": "left-band" }
+}

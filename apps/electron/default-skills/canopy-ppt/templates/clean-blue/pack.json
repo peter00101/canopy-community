@@ -1,0 +1,19 @@
+{
+  "id": "clean-blue",
+  "name": "简报蓝",
+  "description": "办公通用：白底、顶部细色条、底部分隔线。适合周报、汇报、培训。",
+  "canvas": { "w": 1280, "h": 720 },
+  "background": { "type": "svg", "file": "bg.svg" },
+  "safeArea": { "x": 40, "y": 110, "w": 1200, "h": 560 },
+  "titleBox": { "x": 40, "y": 40, "w": 1040, "h": 60, "fontSize": 36 },
+  "footer": { "text": "{{deck_title}}", "x": 40, "y": 700, "pageNumber": { "x": 1240, "y": 700, "anchor": "end" } },
+  "colors": {
+    "bg": "#FFFFFF", "surface": "#F4F7FB", "text": "#1F2A44", "muted": "#7B8794",
+    "brand": "#1E5EFF", "accent": "#FF8A3D", "line": "#DCE3ED"
+  },
+  "fonts": {
+    "title": "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif",
+    "body": "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif"
+  },
+  "shape": { "radius": 16, "cardStroke": true, "decor": "thin-top-bar" }
+}

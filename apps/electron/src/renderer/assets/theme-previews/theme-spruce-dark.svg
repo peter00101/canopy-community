@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 260" width="180" height="260">
+  <!-- 青杉沉夜：带青的深炭夜空 + 柔青绿冷光 + 云杉剪影，色值取自 .theme-spruce-dark -->
+  <defs>
+    <linearGradient id="spruce-dark-sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0e161a"/>
+      <stop offset="1" stop-color="#1b262a"/>
+    </linearGradient>
+    <radialGradient id="spruce-dark-glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#45c4b0" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#45c4b0" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="180" height="260" fill="url(#spruce-dark-sky)"/>
+  <!-- 极光式冷光带（不用纯黑，留住青色相） -->
+  <ellipse cx="112" cy="78" rx="78" ry="46" fill="url(#spruce-dark-glow)"/>
+  <circle cx="126" cy="58" r="13" fill="#a9e6dc"/>
+  <circle cx="126" cy="58" r="24" fill="#45c4b0" opacity="0.18"/>
+  <!-- 疏星 -->
+  <circle cx="34" cy="44" r="1.6" fill="#cfeee7" opacity="0.9"/>
+  <circle cx="58" cy="30" r="1.2" fill="#cfeee7" opacity="0.7"/>
+  <circle cx="84" cy="52" r="1" fill="#cfeee7" opacity="0.55"/>
+  <circle cx="160" cy="36" r="1.4" fill="#cfeee7" opacity="0.75"/>
+  <!-- 远岭 -->
+  <path d="M0 142 Q36 114 70 136 Q100 156 128 132 Q154 110 180 134 V172 H0 Z" fill="#1d2b30"/>
+  <!-- 地面 -->
+  <path d="M0 172 Q46 162 92 170 T180 164 V260 H0 Z" fill="#141d21"/>
+  <!-- 后排云杉：暗青 -->
+  <path d="M40 172 L50 138 L60 172 Z" fill="#24403f"/>
+  <path d="M42 157 L50 130 L58 157 Z" fill="#24403f"/>
+  <path d="M136 174 L145 143 L154 174 Z" fill="#24403f"/>
+  <path d="M138 160 L145 136 L152 160 Z" fill="#24403f"/>
+  <!-- 前排云杉：主色描边的剪影 -->
+  <path d="M72 218 L90 154 L108 218 Z" fill="#16292c"/>
+  <path d="M76 190 L90 142 L104 190 Z" fill="#16292c"/>
+  <path d="M80 166 L90 132 L100 166 Z" fill="#16292c"/>
+  <path d="M80 166 L90 132 L100 166" stroke="#45c4b0" stroke-width="1.6" fill="none" opacity="0.75"/>
+  <path d="M76 190 L90 142 L104 190" stroke="#45c4b0" stroke-width="1.4" fill="none" opacity="0.5"/>
+  <rect x="87" y="216" width="6" height="16" fill="#0f1c1e"/>
+  <!-- 侧旁小杉 -->
+  <path d="M18 210 L30 170 L42 210 Z" fill="#1c3335"/>
+  <path d="M22 188 L30 160 L38 188 Z" fill="#1c3335"/>
+  <rect x="27" y="208" width="5" height="12" fill="#0f1c1e"/>
+  <!-- 地平线冷光 -->
+  <path d="M0 172 Q46 162 92 170 T180 164" stroke="#45c4b0" stroke-width="1.6" fill="none" opacity="0.4"/>
+</svg>

@@ -1,0 +1,29 @@
+{
+  "name": "@canopy/business-im-bridge",
+  "version": "0.1.4",
+  "license": "AGPL-3.0-only",
+  "description": "Canopy IM 桥接（飞书/钉钉/微信）业务层：消息收发、渠道/模型切换命令、会话绑定持久化，只通过接口注入依赖内核与 Electron 基础设施",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@canopy/brand": "workspace:*",
+    "@canopy/kernel": "workspace:*",
+    "@canopy/shared": "workspace:*",
+    "@larksuiteoapi/node-sdk": "^1.65.0",
+    "dingtalk-stream-sdk-nodejs": "^2.0.4",
+    "qrcode": "^1.5.4",
+    "typebox": "1.3.27"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "typescript": "^5.0.0"
+  }
+}

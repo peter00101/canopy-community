@@ -1,0 +1,2150 @@
+/**
+ * DiffTabContent — 单文件 Diff 或纯文件预览内容
+ *
+ * previewOnly=true 时：代码高亮预览（@pierre/diffs File）、Markdown 或 HTML 渲染
+ * previewOnly=false（默认）：显示 git diff（旧版本 vs 磁盘）
+ */
+
+import * as React from 'react'
+import { ChevronRight, Code2, Copy, Check, Eye, FolderOpen, List, Pencil, RotateCw, Save, WrapText, X } from 'lucide-react'
+import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai'
+import DOMPurify from 'dompurify'
+import { File as PierreFile } from '@pierre/diffs/react'
+import { toast } from 'sonner'
+import type { FilePreviewMetadata, SpreadsheetGridHint } from '@canopy/shared'
+import { cn } from '@/lib/utils'
+import {
+  agentDiffPanelTabAtom,
+  agentDiffViewModeAtom,
+  agentDiffRefreshVersionAtom,
+  agentSidePanelOpenAtomFamily,
+} from '@/atoms/agent-atoms'
+import { resolvedThemeAtom } from '@/atoms/theme'
+import {
+  getPreviewContentRefreshKey,
+  previewCodeWrapAtom,
+  previewContentRefreshVersionAtom,
+  previewResolvedPathAtom,
+  quotedSelectionMapAtom,
+} from '@/atoms/preview-atoms'
+import {
+  agentSideChatMapAtom,
+  conversationsAtom,
+  conversationDraftsAtom,
+  conversationQuotedSelectionMapAtom,
+  selectedModelAtom,
+} from '@/atoms/chat-atoms'
+import { markdownTocOpenAtom } from '@/atoms/markdown-toc'
+import { useFocusAgentSessionInput } from '@/hooks/useFocusAgentSessionInput'
+import { useShortcut } from '@/hooks/useShortcut'
+import { initShortcutRegistry } from '@/lib/shortcut-registry'
+import { DiffView } from './DiffView'
+import { EditorView } from '@codemirror/view'
+import { LiveMarkdownEditor, type LiveMarkdownEditorHandle, type LiveMarkdownTextSelection } from '@/components/markdown/LiveMarkdownEditor'
+import { useLocalMarkdownImageResolver } from '@/components/markdown/use-local-image-resolver'
+import { extractMarkdownSourceHeadings } from '@/components/markdown/markdown-source-headings'
+import { getPreviewCandidateBasePaths, isAbsoluteFilePath } from './preview-open-path'
+import { classifyTextPreviewResult } from '@/lib/preview-load-state'
+import { DefaultAppOpenButton } from './DefaultAppOpenButton'
+import { UnsupportedFilePreview } from './UnsupportedFilePreview'
+import { PsdFilePreview } from './PsdFilePreview'
+import { PreviewFindBar, type PreviewFindProvider } from './PreviewFindBar'
+import { SpreadsheetGridPreview } from './SpreadsheetGridPreview'
+import { LegacyPptPreview } from './LegacyPptPreview'
+import { MarkdownToc, type SourceTocEntry } from './MarkdownToc'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { PIERRE_FILE_CSS } from '@/components/agent/tool-result-renderers/pierre-styles'
+import { SelectionActionPopover } from '@/components/selection/SelectionActionPopover'
+import { focusChatInput } from '@/components/chat/focus-chat-input'
+import { getOrCreateSideChat } from '@/lib/side-chat'
+import { insertAgentInputQuote } from '@/lib/agent-input-quote'
+import { SELECTION_ACTION_POPOVER_SELECTOR } from '@/lib/quoted-selection'
+import { copyTextToClipboard } from '@/lib/clipboard'
+import {
+  clearPreviewContentCacheForFile,
+  clearPreviewContentCacheForSession,
+  getPreviewContentCache,
+  setPreviewContentCache,
+} from '@/lib/preview-content-cache'
+import {
+  clearMarkdownEditorStateForSession,
+  createMarkdownEditorCacheKey,
+  createMarkdownEditorViewState,
+  enqueueMarkdownEditorSave,
+  getMarkdownEditorStateSessionEpoch,
+  getMarkdownEditorViewState,
+  isMarkdownEditorOwnerCurrent,
+  canPersistMarkdownEditorState,
+  setMarkdownEditorViewState,
+  type MarkdownEditorOwner,
+  type MarkdownEditorViewState,
+  type MarkdownScrollPosition,
+} from '@/lib/markdown-editor-state'
+
+const MD_EXTS = new Set(['.md', '.markdown'])
+const HTML_EXTS = new Set(['.html', '.htm'])
+const PLAIN_TEXT_EDIT_EXTS = new Set(['.txt', '.text', '.log'])
+const PDF_EXTS = new Set(['.pdf'])
+const OFFICE_PREVIEW_EXTS = new Set(['.docx', '.xlsx', '.pptx'])
+const LEGACY_OFFICE_EXTS = new Set(['.doc', '.xls', '.ppt'])
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.bmp', '.ico'])
+/** PSD：合成图 + 图层树由 PsdFilePreview 自己经 file:psd-preview 取，与 Office 一样从文件区或改动区打开都走预览 */
+const PSD_EXTS = new Set(['.psd'])
+
+function getPreviewTargetPath(filePath: string, dirPath: string): string {
+  return isAbsoluteFilePath(filePath) ? filePath : `${dirPath.replace(/[\\/]+$/, '')}/${filePath}`
+}
+
+function getParentFolderPath(filePath: string): string {
+  const separator = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'))
+  return separator > 0 ? filePath.slice(0, separator) : filePath
+}
+const FILE_FIND_SHORTCUT_OPTIONS = { exclusive: true }
+
+/**
+ * 预览内容按 session、路径、version 与解析范围做 LRU 缓存（实现在 lib/preview-content-cache.ts）。
+ * - diff：`${sessionId}:diff:${filePath}@v${refreshVersion}:${scope}`
+ * - 纯预览：`${sessionId}:preview:${filePath}@v${previewContentVersion}:${scope}`
+ * 关闭预览标签与手动刷新会按文件清掉这份缓存；此前这里另存了一份私有缓存，关闭时清的是另一份，
+ * 重开后版本号从头计数、命中旧条目，显示的就是关闭前的旧内容。
+ */
+interface DeepSelection {
+  text: string
+  rect: DOMRect | null
+}
+
+interface PreviewTextSelection {
+  text: string
+  x: number
+  y: number
+  filePath: string
+}
+
+/** 超过此字符数的文本文件将跳过 PierreFile 高亮，直接以纯文本展示，避免大文件卡顿 */
+const MAX_PREVIEW_CHARS = 500_000
+
+/** 选中文本最大字符数（与 Bozeman DOM 模式一致） */
+const MAX_QUOTED_CHARS = 2000
+
+/** 滚动位置持久化，按会话、路径与预览解析范围隔离。 */
+const scrollPositionCache = new Map<string, { top: number; left: number }>()
+
+function scrollCacheKey(sessionId: string, filePath: string, scope = ''): string {
+  return `${sessionId}:${filePath}:${scope}`
+}
+
+/** 获取缓存的滚动位置 */
+export function getPreviewScrollPosition(sessionId: string, filePath: string, scope?: string): { top: number; left: number } | undefined {
+  return scrollPositionCache.get(scrollCacheKey(sessionId, filePath, scope))
+}
+
+/**
+ * 清除指定 session 的预览缓存，供 useCloseTab 调用。
+ */
+export function clearPreviewCacheForSession(sessionId: string): void {
+  const prefix = `${sessionId}:`
+  for (const key of scrollPositionCache.keys()) {
+    if (key.startsWith(prefix)) scrollPositionCache.delete(key)
+  }
+  clearPreviewContentCacheForSession(sessionId)
+  clearMarkdownEditorStateForSession(sessionId)
+}
+
+function getExtension(filePath: string): string {
+  const dot = filePath.lastIndexOf('.')
+  return dot >= 0 ? filePath.slice(dot).toLowerCase() : ''
+}
+
+/** 判断选区是否在容器内（穿透 Shadow DOM 边界） */
+function isSelectionInside(container: HTMLElement, selection: Selection): boolean {
+  if (selection.rangeCount === 0) return false
+  const range = selection.getRangeAt(0)
+  let node: Node | null = range.commonAncestorContainer
+  while (node) {
+    if (node === container) return true
+    const root = node.getRootNode()
+    if (root instanceof ShadowRoot) {
+      // Shadow DOM 边界：从 shadowRoot.host 继续向上
+      node = root.host
+    } else {
+      // 普通 DOM：沿 parentNode 向上
+      node = node.parentNode
+    }
+  }
+  return false
+}
+
+function getSelectionAnchorRect(selection: Selection): DOMRect | null {
+  if (selection.rangeCount === 0) return null
+  const range = selection.getRangeAt(0)
+  const rect = range.getBoundingClientRect()
+  if (rect.width > 0 || rect.height > 0) return rect
+  return range.getClientRects()[0] ?? null
+}
+
+/** 获取容器内的选区：先查光 DOM，再遍历缓存的 ShadowRoot 集合 */
+function getDeepSelection(container: HTMLElement, shadowRoots?: Set<ShadowRoot> | null): DeepSelection | null {
+  const docSel = document.getSelection()
+  if (docSel && !docSel.isCollapsed && docSel.rangeCount > 0) {
+    if (isSelectionInside(container, docSel)) {
+      const text = docSel.toString().trim()
+      if (text) return { text, rect: getSelectionAnchorRect(docSel) }
+    }
+  }
+
+  if (shadowRoots) {
+    // 直接遍历缓存的 ShadowRoot（O(n) 其中 n = ShadowRoot 数量，通常 2-3 个）
+    for (const sr of shadowRoots) {
+      // 检查 host 是否仍在 DOM 中（可能已被移除）
+      if (!container.contains(sr.host)) continue
+      const shadowSel = (sr as { getSelection?: () => Selection | null }).getSelection?.()
+      if (shadowSel && !shadowSel.isCollapsed && shadowSel.rangeCount > 0) {
+        const text = shadowSel.toString().trim()
+        if (text) return { text, rect: getSelectionAnchorRect(shadowSel) }
+      }
+    }
+    return null
+  }
+
+  // 兜底：无缓存时递归遍历（组件初始化瞬间可能命中一次）
+  function walk(node: Node): DeepSelection | null {
+    if (node instanceof HTMLElement && node.shadowRoot) {
+      const shadowSel = (node.shadowRoot as { getSelection?: () => Selection | null }).getSelection?.()
+      if (shadowSel && !shadowSel.isCollapsed && shadowSel.rangeCount > 0) {
+        const text = shadowSel.toString().trim()
+        if (text) return { text, rect: getSelectionAnchorRect(shadowSel) }
+      }
+      const result = walk(node.shadowRoot)
+      if (result) return result
+    }
+    for (const child of node.childNodes) {
+      const result = walk(child)
+      if (result) return result
+    }
+    return null
+  }
+  return walk(container)
+}
+
+/** 用 TreeWalker 发现容器内所有现有 ShadowRoot（仅初始化时调用一次） */
+function discoverShadowRoots(root: Node, target: Set<ShadowRoot>): void {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT)
+  while (walker.nextNode()) {
+    const el = walker.currentNode as HTMLElement
+    if (el.shadowRoot) target.add(el.shadowRoot)
+  }
+}
+
+interface DiffTabContentProps {
+  filePath: string
+  dirPath: string
+  sessionId: string
+  gitRoot?: string
+  previewOnly?: boolean
+  /** 禁用预览内编辑，适用于 clipboard 等临时快照 */
+  readOnly?: boolean
+  /** 候选基础目录（previewOnly 模式下用于路径解析） */
+  basePaths?: string[]
+  /** 仅可信 UI 主动选择的文件允许超出会话授权根。 */
+  unrestricted?: boolean
+  /** Managed Skill workspace slug for a relocatable relative path. */
+  workspaceSkillSlug?: string
+  /** Original absolute Skill entry path used as a legacy fallback. */
+  legacySkillFilePath?: string
+  /** diff 模式下检测到内容为空（无差异）时回调，用于自动关闭预览面板 */
+  onEmptyDiff?: () => void
+  /** 由外层场景注入的额外工具按钮，例如默认应用打开、返回会话 */
+  toolbarActions?: React.ReactNode
+  /** 基准 ref（如 "origin/main"），用于 worktree vs main 模式 */
+  baseRef?: string
+}
+
+export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly, readOnly, basePaths, unrestricted, workspaceSkillSlug, legacySkillFilePath, onEmptyDiff, toolbarActions, baseRef }: DiffTabContentProps): React.ReactElement {
+  const ext = getExtension(filePath)
+  const isMarkdown = previewOnly && MD_EXTS.has(ext)
+  const isHtml = previewOnly && HTML_EXTS.has(ext)
+  const isPlainTextEditable = previewOnly && PLAIN_TEXT_EDIT_EXTS.has(ext)
+  const isEditableText = isMarkdown || isPlainTextEditable
+  const isPdf = previewOnly && PDF_EXTS.has(ext)
+  // DOCX/XLSX/PPTX 没有可读的文本 diff；无论从文件区还是改动区打开都走 Office 预览。
+  const isOfficePreview = OFFICE_PREVIEW_EXTS.has(ext)
+  const isLegacyOffice = previewOnly && LEGACY_OFFICE_EXTS.has(ext)
+  const isImage = previewOnly && IMAGE_EXTS.has(ext)
+  const isPsd = PSD_EXTS.has(ext)
+  const markdownEditorCacheKey = React.useMemo(
+    () => createMarkdownEditorCacheKey({ filePath, dirPath, gitRoot, basePaths }),
+    [basePaths, dirPath, filePath, gitRoot],
+  )
+  const initialMarkdownEditorState = React.useMemo(() => {
+    if (!isEditableText || readOnly) return undefined
+    return getMarkdownEditorViewState(sessionId, markdownEditorCacheKey)
+  }, [isEditableText, markdownEditorCacheKey, readOnly, sessionId])
+  const markdownEditorScrollScope = `${markdownEditorCacheKey}:${readOnly ? 'readonly' : 'editable'}`
+
+  const [viewMode, setViewMode] = useAtom(agentDiffViewModeAtom)
+  const [oldContent, setOldContent] = React.useState('')
+  const [newContent, setNewContent] = React.useState('')
+  const [unsupportedPreviewReason, setUnsupportedPreviewReason] = React.useState('')
+  const [previewMetadata, setPreviewMetadata] = React.useState<FilePreviewMetadata | undefined>()
+  // Markdown 预览本身就是 LiveMarkdown 编辑器，不再通过按钮切换编辑态。
+  const [markdownEditing, setMarkdownEditing] = React.useState(
+    () => Boolean((isMarkdown && !readOnly) || initialMarkdownEditorState?.editing),
+  )
+  const [markdownSourceMode, setMarkdownSourceMode] = React.useState(false)
+  const [markdownDraft, setMarkdownDraft] = React.useState(
+    () => initialMarkdownEditorState?.draft ?? '',
+  )
+  const [markdownSaving, setMarkdownSaving] = React.useState(false)
+  const [autosaveStatus, setAutosaveStatus] = React.useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+  const lastSavedDraftRef = React.useRef(initialMarkdownEditorState?.lastSavedDraft ?? '')
+  const markdownEditorStateRef = React.useRef<MarkdownEditorViewState>(
+    initialMarkdownEditorState ?? createMarkdownEditorViewState(),
+  )
+  const markdownEditorStateOwnerRef = React.useRef({ sessionId, cacheKey: markdownEditorCacheKey })
+  const markdownEditingRef = React.useRef(markdownEditing)
+  markdownEditingRef.current = markdownEditing
+  const activeMarkdownEditing = Boolean(markdownEditing && !Boolean(readOnly) && isEditableText)
+  const markdownOwnerSessionEpoch = getMarkdownEditorStateSessionEpoch(sessionId)
+  const ownerSignatureRef = React.useRef({ sessionId, cacheKey: markdownEditorCacheKey, readOnly: Boolean(readOnly), sessionEpoch: markdownOwnerSessionEpoch })
+  const markdownOwnerRef = React.useRef<MarkdownEditorOwner>({ sessionId, cacheKey: markdownEditorCacheKey, generation: 0, sessionEpoch: markdownOwnerSessionEpoch })
+  if (
+    ownerSignatureRef.current.sessionId !== sessionId
+    || ownerSignatureRef.current.cacheKey !== markdownEditorCacheKey
+    || ownerSignatureRef.current.readOnly !== Boolean(readOnly)
+    || ownerSignatureRef.current.sessionEpoch !== markdownOwnerSessionEpoch
+  ) {
+    markdownOwnerRef.current = {
+      sessionId,
+      cacheKey: markdownEditorCacheKey,
+      generation: markdownOwnerRef.current.generation + 1,
+      sessionEpoch: getMarkdownEditorStateSessionEpoch(sessionId),
+    }
+    ownerSignatureRef.current = { sessionId, cacheKey: markdownEditorCacheKey, readOnly: Boolean(readOnly), sessionEpoch: getMarkdownEditorStateSessionEpoch(sessionId) }
+  }
+  const ownerGeneration = markdownOwnerRef.current.generation
+  const componentMountedRef = React.useRef(true)
+  const autosaveTimerRef = React.useRef<number | null>(null)
+  const sourceTextareaRef = React.useRef<HTMLTextAreaElement>(null)
+  const pendingPreviewScrollRestoreRef = React.useRef<MarkdownScrollPosition | null>(null)
+  const preserveScrollOnNextRefreshRef = React.useRef(false)
+  const [previewScrollRestoreVersion, setPreviewScrollRestoreVersion] = React.useState(0)
+  const [officeHtml, setOfficeHtml] = React.useState('')
+  const [officeHtmlUrl, setOfficeHtmlUrl] = React.useState('')
+  const [officeText, setOfficeText] = React.useState('')
+  /** xlsx 行数超过 OfficeCLI 显示上限（或被它截断）时改走快速表格视图；旧版 .xls 直接走表格视图、不经这里 */
+  const [spreadsheetGrid, setSpreadsheetGrid] = React.useState<SpreadsheetGridHint | null>(null)
+  /** 快速表格视图挂载后提供的查找实现（后台线程搜全部工作表） */
+  const [gridFindProvider, setGridFindProvider] = React.useState<PreviewFindProvider | undefined>(undefined)
+  // HTML 默认展示运行后的页面；用户可随时切换回源码高亮预览。
+  const [htmlPreviewUrl, setHtmlPreviewUrl] = React.useState('')
+  const [htmlSourceMode, setHtmlSourceMode] = React.useState(false)
+  const [pdfSrc, setPdfSrc] = React.useState('')
+  const [pdfZoom, setPdfZoom] = React.useState(100)
+  const pdfIframeRef = React.useRef<HTMLIFrameElement>(null)
+  /**
+   * PDF 查看器在 iframe 里要等 pdf.js 加载完才开始收消息，早发的会丢。
+   * 查看器就绪后发 `pdf-viewer-ready`，记下是哪个窗口就绪；发给未就绪窗口的消息先排队。
+   */
+  const pdfReadyWindowRef = React.useRef<Window | null>(null)
+  const pdfOutboxRef = React.useRef<Array<Record<string, unknown>>>([])
+  const pdfFindResolversRef = React.useRef(new Map<number, (count: number) => void>())
+  const pdfFindRequestIdRef = React.useRef(0)
+  const [imagePath, setImagePath] = React.useState('')
+  const [imageDataUrl, setImageDataUrl] = React.useState('')
+  // 默认 25%：预览面板空间有限，先展示缩略全貌，用户可手动放大查看细节
+  const [imageZoom, setImageZoom] = React.useState(0.25)
+  const [imageNaturalSize, setImageNaturalSize] = React.useState({ w: 0, h: 0 })
+  const imageContainerRef = React.useRef<HTMLDivElement>(null)
+  const imageDragging = React.useRef(false)
+  const imageDragStart = React.useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null)
+  const [findOpen, setFindOpen] = React.useState(false)
+  const [loading, setLoading] = React.useState(true)
+  const [copied, setCopied] = React.useState(false)
+  const setRefreshVersionMap = useSetAtom(agentDiffRefreshVersionAtom)
+  const setPreviewContentRefreshVersionMap = useSetAtom(previewContentRefreshVersionAtom)
+  const setPreviewResolvedPaths = useSetAtom(previewResolvedPathAtom)
+  const previewContentRefreshKey = React.useMemo(
+    () => getPreviewContentRefreshKey(sessionId, { filePath, previewOnly, gitRoot, baseRef }),
+    [baseRef, filePath, gitRoot, previewOnly, sessionId],
+  )
+  // 预览不能订阅会话级 diff 版本：Agent 写入任意其他文件时该版本会变化。
+  // 用派生 atom 只订阅当前模式实际使用的版本，避免无关写入触发整个 Markdown 预览重渲染。
+  const contentRefreshVersionAtom = React.useMemo(() => atom((get) => {
+    if (previewOnly) return get(previewContentRefreshVersionAtom).get(previewContentRefreshKey) ?? 0
+    return get(agentDiffRefreshVersionAtom).get(sessionId) ?? 0
+  }), [previewContentRefreshKey, previewOnly, sessionId])
+  const contentRefreshVersion = useAtomValue(contentRefreshVersionAtom)
+  const refreshVersion = previewOnly ? 0 : contentRefreshVersion
+  const previewContentVersion = previewOnly ? contentRefreshVersion : 0
+  const theme = useAtomValue(resolvedThemeAtom)
+  const [codeWrap, setCodeWrap] = useAtom(previewCodeWrapAtom)
+  const [tocOpen, setTocOpen] = useAtom(markdownTocOpenAtom)
+
+  const canTogglePreviewWrap =
+    previewOnly &&
+    !activeMarkdownEditing &&
+    !isMarkdown &&
+    (!isHtml || htmlSourceMode) &&
+    !isPdf &&
+    !isImage &&
+    !isOfficePreview &&
+    !isPsd &&
+    !isLegacyOffice &&
+    newContent.length > 0 &&
+    newContent.length <= MAX_PREVIEW_CHARS
+  const previewWrapLabel = codeWrap
+    ? '当前为自动换行，点击改为横向滚动'
+    : '当前为横向滚动，点击改为自动换行'
+
+  React.useEffect(() => {
+    initShortcutRegistry()
+  }, [])
+
+  useShortcut(
+    'file-find',
+    React.useCallback(() => setFindOpen(true), []),
+    true,
+    FILE_FIND_SHORTCUT_OPTIONS,
+  )
+
+  const findContentKey = React.useMemo(() => JSON.stringify({
+    filePath,
+    previewOnly: Boolean(previewOnly),
+    viewMode,
+    loading,
+    newLength: newContent.length,
+    oldLength: oldContent.length,
+    officeLength: officeHtml.length,
+    officeHtmlUrl,
+    htmlPreviewUrl,
+    htmlSourceMode,
+    pdfSrc,
+    markdownEditing: activeMarkdownEditing,
+    markdownSourceMode: activeMarkdownEditing && markdownSourceMode,
+  }), [filePath, loading, activeMarkdownEditing, markdownSourceMode, newContent.length, officeHtml.length, officeHtmlUrl, htmlPreviewUrl, htmlSourceMode, oldContent.length, pdfSrc, previewOnly, viewMode])
+
+  // 目录必须随完整 Markdown 内容更新：仅使用长度会漏掉等长标题修改，留下
+  // 旧标题、旧锚点或错误层级。loading/编辑态切换仍不参与该 key，避免无关抖动。
+  const tocContentKey = React.useMemo(
+    () => JSON.stringify({ filePath, previewContentVersion, content: newContent }),
+    [filePath, previewContentVersion, newContent],
+  )
+
+  // ===== 目录：源码模式 =====
+  // LiveMarkdown 预览走 CodeMirror 视口虚拟化，渲染 DOM 里只有可见区附近的标题，
+  // 从 DOM 提取的目录在长文档上必然不全且随滚动整窗置换。改从完整源码提取标题，
+  // 跳转与滚动联动都经 CodeMirror 文档行号完成，与视口内渲染了什么无关。
+  const liveMarkdownEditorRef = React.useRef<LiveMarkdownEditorHandle>(null)
+  const tocSourceText = readOnly ? newContent : (markdownDraft || newContent)
+  const tocSourceHeadings = React.useMemo<SourceTocEntry[]>(() => {
+    if (!isMarkdown) return []
+    return extractMarkdownSourceHeadings(tocSourceText).map((heading) => ({ id: `L${heading.line}`, ...heading }))
+  }, [isMarkdown, tocSourceText])
+  const [tocActiveId, setTocActiveId] = React.useState<string | null>(null)
+
+  const navigateToTocHeading = React.useCallback((heading: SourceTocEntry) => {
+    const view = liveMarkdownEditorRef.current?.getView()
+    if (!view || heading.line > view.state.doc.lines) return
+    const pos = view.state.doc.line(heading.line).from
+    view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'start', yMargin: 8 }) })
+  }, [])
+
+  React.useEffect(() => {
+    if (!isMarkdown || !tocOpen || tocSourceHeadings.length === 0) {
+      setTocActiveId(null)
+      return
+    }
+    const container = scrollContainerRef.current
+    if (!container) return
+    let frame = 0
+    const compute = (): void => {
+      frame = 0
+      const view = liveMarkdownEditorRef.current?.getView()
+      if (!view) return
+      const containerRect = container.getBoundingClientRect()
+      // 判定带压在容器顶部 ~30%，与 DOM 模式 useScrollSpy 的 rootMargin 同口径；
+      // lineBlockAtHeight 对未渲染行返回估算几何，够联动用
+      const bandY = containerRect.top + Math.min(containerRect.height * 0.3, 240)
+      const block = view.lineBlockAtHeight(bandY - view.documentTop)
+      const lineNumber = view.state.doc.lineAt(Math.min(block.from, view.state.doc.length)).number
+      let active = tocSourceHeadings[0]!.id
+      for (const heading of tocSourceHeadings) {
+        if (heading.line <= lineNumber) active = heading.id
+        else break
+      }
+      setTocActiveId(active)
+    }
+    const schedule = (): void => {
+      if (!frame) frame = requestAnimationFrame(compute)
+    }
+    container.addEventListener('scroll', schedule, { passive: true })
+    // 编辑器异步挂载：就绪前 getView() 为 null，轮询到位后补一次初算
+    let readyTimer: number = window.setInterval(() => {
+      if (!liveMarkdownEditorRef.current?.getView()) return
+      window.clearInterval(readyTimer)
+      readyTimer = 0
+      schedule()
+    }, 200)
+    schedule()
+    return () => {
+      container.removeEventListener('scroll', schedule)
+      if (frame) cancelAnimationFrame(frame)
+      if (readyTimer) window.clearInterval(readyTimer)
+    }
+  }, [isMarkdown, tocOpen, tocSourceHeadings])
+
+  // ===== 选中文本引用（Quoted Selection）=====
+
+  const setQuotedSelectionMap = useSetAtom(quotedSelectionMapAtom)
+  const selectedChatModel = useAtomValue(selectedModelAtom)
+  const conversations = useAtomValue(conversationsAtom)
+  const sideChatMap = useAtomValue(agentSideChatMapAtom)
+  const setConversations = useSetAtom(conversationsAtom)
+  const setConversationDrafts = useSetAtom(conversationDraftsAtom)
+  const setChatQuotedSelectionMap = useSetAtom(conversationQuotedSelectionMapAtom)
+  const setSideChatMap = useSetAtom(agentSideChatMapAtom)
+  const setSidePanelOpen = useSetAtom(agentSidePanelOpenAtomFamily(sessionId))
+  const setSidePanelTabMap = useSetAtom(agentDiffPanelTabAtom)
+  const focusAgentSessionInput = useFocusAgentSessionInput()
+  const [previewSelection, setPreviewSelection] = React.useState<PreviewTextSelection | null>(null)
+  const filePathRef = React.useRef(filePath)
+  filePathRef.current = filePath
+  const shadowRootsRef = React.useRef<Set<ShadowRoot>>(new Set())
+  const pointerSelectingRef = React.useRef(false)
+  const captureTimerRef = React.useRef<number | null>(null)
+  const openSelectionChatPendingRef = React.useRef(false)
+  /** 当前正在展示的截断 toast id；选中回落到上限内或选区消失时主动 dismiss */
+  const lastToastIdRef = React.useRef<string | null>(null)
+
+  const dismissTruncationToast = React.useCallback(() => {
+    if (lastToastIdRef.current) {
+      toast.dismiss(lastToastIdRef.current)
+      lastToastIdRef.current = null
+    }
+  }, [])
+
+  const clearPreviewSelection = React.useCallback(() => {
+    setPreviewSelection(null)
+  }, [])
+
+  /** 将 DOM 或 CodeMirror 的选区归一为同一套引用动作。 */
+  const capturePreviewSelection = React.useCallback((text: string, x: number, y: number) => {
+    const truncated = text.length > MAX_QUOTED_CHARS
+    const quotedText = truncated ? text.slice(0, MAX_QUOTED_CHARS) : text
+    setPreviewSelection({
+      text: quotedText,
+      x,
+      y: Math.max(12, y),
+      filePath: filePathRef.current,
+    })
+
+    // 超过上限时按千位分档 toast；跨档时撤掉上一档，回到上限内则全部撤掉
+    if (truncated) {
+      const k = Math.floor(text.length / 1000) * 1000
+      const id = `quoted-chars-cap:${sessionId}:${k}`
+      if (lastToastIdRef.current && lastToastIdRef.current !== id) {
+        toast.dismiss(lastToastIdRef.current)
+      }
+      toast.warning(`已选中 >${k} 字符，仅能发送前 ${MAX_QUOTED_CHARS} 字符`, {
+        id,
+        duration: 3000,
+      })
+      lastToastIdRef.current = id
+    } else {
+      dismissTruncationToast()
+    }
+  }, [dismissTruncationToast, sessionId])
+
+  /** 捕获预览面板中的 DOM 文本选中，显示动作弹层。 */
+  const handleSelectionCapture = React.useCallback(() => {
+    if (!previewOnly || activeMarkdownEditing) return
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    const deepSel = getDeepSelection(container, shadowRootsRef.current)
+    if (!deepSel?.rect) {
+      clearPreviewSelection()
+      return
+    }
+
+    capturePreviewSelection(
+      deepSel.text,
+      deepSel.rect.left + deepSel.rect.width / 2,
+      deepSel.rect.top - 12,
+    )
+  }, [activeMarkdownEditing, capturePreviewSelection, clearPreviewSelection, previewOnly])
+
+  /**
+   * ink-mde 的选择由 CodeMirror state 管理，不能可靠地从 window.getSelection() 读取。
+   * 预览 Markdown 也可能是可编辑的，因此直接接收其精确文本与坐标。
+   */
+  const handleLiveMarkdownSelectionChange = React.useCallback((selection: LiveMarkdownTextSelection | null) => {
+    if (!selection) {
+      clearPreviewSelection()
+      return
+    }
+    capturePreviewSelection(selection.text, selection.x, selection.y)
+  }, [capturePreviewSelection, clearPreviewSelection])
+
+  const scheduleSelectionCapture = React.useCallback((): void => {
+    if (captureTimerRef.current != null) {
+      window.clearTimeout(captureTimerRef.current)
+    }
+    captureTimerRef.current = window.setTimeout(() => {
+      captureTimerRef.current = null
+      handleSelectionCapture()
+    }, 80)
+  }, [handleSelectionCapture])
+
+  // 监听选区变化：document selectionchange + 容器内鼠标拖拽轮询
+  React.useEffect(() => {
+    if (!previewOnly) return
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    // 初始化 ShadowRoot 缓存：TreeWalker 一次扫描 + MutationObserver 增量更新
+    const shadowRoots = shadowRootsRef.current
+    shadowRoots.clear()
+    discoverShadowRoots(container, shadowRoots)
+    const mo = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node instanceof HTMLElement && node.shadowRoot) shadowRoots.add(node.shadowRoot)
+          // 递归发现新增子树中的 shadowRoot
+          discoverShadowRoots(node, shadowRoots)
+        }
+        for (const node of m.removedNodes) {
+          if (node instanceof HTMLElement) {
+            if (node.shadowRoot) shadowRoots.delete(node.shadowRoot)
+            // 清理被移除子树中的所有 ShadowRoot 引用，避免 Set 持有已分离节点
+            const stale = new Set<ShadowRoot>()
+            discoverShadowRoots(node, stale)
+            for (const sr of stale) shadowRoots.delete(sr)
+          }
+        }
+      }
+    })
+    mo.observe(container, { childList: true, subtree: true })
+
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target
+      if (target instanceof Element && target.closest(SELECTION_ACTION_POPOVER_SELECTOR)) return
+      if (e.button === 0) {
+        pointerSelectingRef.current = true
+        clearPreviewSelection()
+      }
+    }
+    const onMouseUp = () => {
+      if (!pointerSelectingRef.current) return
+      pointerSelectingRef.current = false
+      scheduleSelectionCapture()
+    }
+    const onSelectionChange = () => {
+      if (pointerSelectingRef.current) return
+      const docSel = document.getSelection()
+      if (!docSel || docSel.isCollapsed) {
+        clearPreviewSelection()
+        return
+      }
+      if (isSelectionInside(container, docSel)) {
+        scheduleSelectionCapture()
+      }
+    }
+
+    container.addEventListener('mousedown', onMouseDown)
+    document.addEventListener('mouseup', onMouseUp)
+    document.addEventListener('selectionchange', onSelectionChange)
+    return () => {
+      if (captureTimerRef.current != null) {
+        window.clearTimeout(captureTimerRef.current)
+        captureTimerRef.current = null
+      }
+      mo.disconnect()
+      shadowRoots.clear()
+      container.removeEventListener('mousedown', onMouseDown)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.removeEventListener('selectionchange', onSelectionChange)
+      // unmount / 切预览 / 切 session 时撤掉残留的截断 toast，避免贴脸 3 秒
+      dismissTruncationToast()
+    }
+  }, [previewOnly, clearPreviewSelection, dismissTruncationToast, scheduleSelectionCapture])
+
+  const fileAccess = React.useMemo(() => ({
+    sessionId,
+    // 只有文件面板 / 聊天附件等可信 UI 明确标记的用户主动选择可放宽范围；
+    // 模型回复中的 chip 默认受会话显式授权根约束（上游 #2020）。
+    unrestricted: unrestricted === true,
+    ...(workspaceSkillSlug ? { workspaceSkillSlug } : {}),
+    ...(legacySkillFilePath ? { legacySkillFilePath } : {}),
+    // 历史工具调用的预览仅有相对 filePath；以当前 dirPath（通常是会话 CWD）补全解析上下文。
+    // 绝对路径不追加该回退，避免失效路径按同名文件误命中会话目录。
+    candidateBasePaths: getPreviewCandidateBasePaths(basePaths, isAbsoluteFilePath(filePath) ? undefined : dirPath),
+  }), [sessionId, basePaths, dirPath, filePath, unrestricted, workspaceSkillSlug, legacySkillFilePath])
+
+  // Markdown 里的本地图片相对的是 md 文件自身目录，排在会话侧候选目录之前
+  const resolveMarkdownImageSrc = useLocalMarkdownImageResolver(
+    fileAccess,
+    isMarkdown ? getParentFolderPath(getPreviewTargetPath(filePath, dirPath)) : null,
+  )
+
+  const contentCacheScope = React.useMemo(() => JSON.stringify({
+    dirPath,
+    gitRoot: gitRoot ?? '',
+    basePaths: basePaths ?? [],
+  }), [basePaths, dirPath, gitRoot])
+
+  const getContentCacheKey = React.useCallback((mode: 'preview' | 'diff', version: number) => (
+    `${sessionId}:${mode}:${filePath}@v${version}:${contentCacheScope}`
+  ), [contentCacheScope, filePath, sessionId])
+
+  // PierreFile props 缓存，避免每次渲染创建新对象导致内部重新高亮
+  const pierreFile = React.useMemo(() => ({
+    name: filePath.split('/').pop() ?? filePath,
+    contents: newContent,
+    cacheKey: `${filePath}:${newContent.length}:${previewContentVersion}`,
+  }), [filePath, newContent, previewContentVersion])
+
+  const pierreOptions = React.useMemo(() => ({
+    theme: { dark: 'one-dark-pro' as const, light: 'one-light' as const },
+    disableFileHeader: true,
+    overflow: codeWrap ? 'wrap' as const : 'scroll' as const,
+    themeType: theme as 'light' | 'dark' | 'system',
+    unsafeCSS: PIERRE_FILE_CSS,
+  }), [theme, codeWrap])
+  // props 变化时立即清空内容状态，避免在 useEffect 执行前渲染旧数据
+  React.useEffect(() => {
+    const restoredEditorState = !readOnly && isEditableText
+      ? getMarkdownEditorViewState(sessionId, markdownEditorCacheKey)
+      : undefined
+    const nextEditorState = restoredEditorState ?? createMarkdownEditorViewState()
+
+    markdownEditorStateRef.current = nextEditorState
+    markdownEditorStateOwnerRef.current = { sessionId, cacheKey: markdownEditorCacheKey }
+    if (restoredEditorState) {
+      scrollPositionCache.set(scrollCacheKey(sessionId, filePath, markdownEditorScrollScope), restoredEditorState.previewScroll)
+    }
+    lastSavedDraftRef.current = nextEditorState.lastSavedDraft
+    markdownEditingRef.current = Boolean((isMarkdown || nextEditorState.editing) && isEditableText && !readOnly)
+    pendingPreviewScrollRestoreRef.current = null
+
+    setOldContent('')
+    setNewContent('')
+    setOfficeHtml('')
+    setOfficeHtmlUrl('')
+    setOfficeText('')
+    setSpreadsheetGrid(null)
+    setHtmlPreviewUrl('')
+    setHtmlSourceMode(false)
+    setPdfSrc('')
+    setPdfZoom(100)
+    setImagePath('')
+    setImageDataUrl('')
+    setImageZoom(0.25)
+    setImageNaturalSize({ w: 0, h: 0 })
+    setLoading(!isLegacyOffice)
+    setMarkdownEditing(Boolean((isMarkdown || nextEditorState.editing) && isEditableText && !readOnly))
+    setMarkdownSourceMode(false)
+    setMarkdownDraft(nextEditorState.draft)
+    setMarkdownSaving(false)
+    setAutosaveStatus('idle')
+  }, [filePath, sessionId, previewOnly, isLegacyOffice, isEditableText, isMarkdown, readOnly, markdownEditorCacheKey])
+
+  // non-passive wheel listener for pinch-to-zoom on image
+  React.useEffect(() => {
+    const el = imageContainerRef.current
+    if (!el || !isImage) return
+    const handler = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault()
+        setImageZoom((z) => Math.max(0.1, Math.min(5, z * (e.deltaY < 0 ? 1.04 : 1 / 1.04))))
+      }
+    }
+    el.addEventListener('wheel', handler, { passive: false })
+    return () => el.removeEventListener('wheel', handler)
+  }, [isImage, imageDataUrl])
+
+  const settlePdfFindRequests = React.useCallback(() => {
+    for (const resolve of pdfFindResolversRef.current.values()) resolve(0)
+    pdfFindResolversRef.current.clear()
+  }, [])
+
+  const postToPdfViewer = React.useCallback((message: Record<string, unknown>) => {
+    const target = pdfIframeRef.current?.contentWindow ?? null
+    if (!target || target !== pdfReadyWindowRef.current) {
+      // 排队时只留最新一次查找：旧查找与跟在它后面的定位都作废
+      if (message.type === 'pdf-find') {
+        pdfOutboxRef.current = pdfOutboxRef.current.filter((queued) => queued.type !== 'pdf-find' && queued.type !== 'pdf-find-activate')
+      }
+      pdfOutboxRef.current.push(message)
+      return
+    }
+    target.postMessage(message, '*')
+  }, [])
+
+  // 换文件 / 刷新会重建查看器：旧排队作废，挂起的查找以 0 个结束（查找栏随内容键变化会重搜）
+  React.useEffect(() => {
+    pdfReadyWindowRef.current = null
+    pdfOutboxRef.current = []
+    settlePdfFindRequests()
+  }, [pdfSrc, settlePdfFindRequests])
+
+  // 监听 PDF iframe 的消息：缩放百分比、就绪握手、查找结果、iframe 内按下的 Ctrl/Cmd+F
+  React.useEffect(() => {
+    if (!isPdf) return
+    const handler = (e: MessageEvent) => {
+      const frameWindow = pdfIframeRef.current?.contentWindow
+      if (!frameWindow || e.source !== frameWindow) return
+      const data = e.data as { type?: string; zoom?: number; requestId?: number; count?: number } | null
+      if (data?.type === 'pdf-zoom-changed' && typeof data.zoom === 'number') {
+        setPdfZoom(data.zoom)
+      } else if (data?.type === 'pdf-viewer-ready') {
+        pdfReadyWindowRef.current = frameWindow
+        const queued = pdfOutboxRef.current
+        pdfOutboxRef.current = []
+        for (const message of queued) frameWindow.postMessage(message, '*')
+      } else if (data?.type === 'pdf-find-result' && typeof data.requestId === 'number') {
+        const resolve = pdfFindResolversRef.current.get(data.requestId)
+        pdfFindResolversRef.current.delete(data.requestId)
+        resolve?.(typeof data.count === 'number' ? data.count : 0)
+      } else if (data?.type === 'pdf-find-open') {
+        setFindOpen(true)
+      }
+    }
+    window.addEventListener('message', handler)
+    return () => {
+      window.removeEventListener('message', handler)
+      settlePdfFindRequests()
+    }
+  }, [isPdf, settlePdfFindRequests])
+
+  const pdfFindProvider = React.useMemo<PreviewFindProvider | undefined>(() => {
+    if (!isPdf) return undefined
+    return {
+      search: (query, options) => new Promise<number>((resolve) => {
+        settlePdfFindRequests()
+        pdfFindRequestIdRef.current += 1
+        const requestId = pdfFindRequestIdRef.current
+        pdfFindResolversRef.current.set(requestId, resolve)
+        postToPdfViewer({ type: 'pdf-find', requestId, query, options })
+      }),
+      activate: (index) => postToPdfViewer({ type: 'pdf-find-activate', index }),
+      clear: () => postToPdfViewer({ type: 'pdf-find-clear' }),
+    }
+  }, [isPdf, postToPdfViewer, settlePdfFindRequests])
+
+  // 上次加载的内容（refreshVersion 触发时用来对比是否变化）
+  const lastNewContentRef = React.useRef('')
+  const lastOldContentRef = React.useRef('')
+
+  // 滚动位置持久化 key（会话、文件和预览解析范围）。主加载 effect 在缓存未命中时
+  // 也会读它判断是否需要恢复滚动，故声明须早于该 effect。
+  const scrollKey = scrollCacheKey(sessionId, filePath, markdownEditorScrollScope)
+
+  if (
+    markdownEditorStateOwnerRef.current.sessionId === sessionId
+    && markdownEditorStateOwnerRef.current.cacheKey === markdownEditorCacheKey
+  ) {
+    markdownEditorStateRef.current = {
+      ...markdownEditorStateRef.current,
+      editing: markdownEditing,
+      sourceMode: markdownSourceMode,
+      draft: markdownDraft,
+      lastSavedDraft: lastSavedDraftRef.current,
+    }
+  }
+
+  const persistMarkdownEditorViewState = React.useCallback((state: MarkdownEditorViewState) => {
+    if (markdownOwnerRef.current.sessionId !== sessionId
+      || markdownOwnerRef.current.cacheKey !== markdownEditorCacheKey
+      || getMarkdownEditorStateSessionEpoch(sessionId) !== markdownOwnerRef.current.sessionEpoch) return
+    markdownEditorStateRef.current = state
+    markdownEditorStateOwnerRef.current = { sessionId, cacheKey: markdownEditorCacheKey }
+    setMarkdownEditorViewState(sessionId, markdownEditorCacheKey, state)
+  }, [markdownEditorCacheKey, sessionId])
+
+  const updateMarkdownEditorViewState = React.useCallback(
+    (update: (state: MarkdownEditorViewState) => MarkdownEditorViewState) => {
+      if (!canPersistMarkdownEditorState(isEditableText, Boolean(readOnly))) return
+      const nextState = update(markdownEditorStateRef.current)
+      persistMarkdownEditorViewState(nextState)
+    },
+    [isEditableText, persistMarkdownEditorViewState, readOnly],
+  )
+
+  React.useEffect(() => {
+    if (!canPersistMarkdownEditorState(isEditableText, Boolean(readOnly))) return
+    persistMarkdownEditorViewState(markdownEditorStateRef.current)
+  }, [isEditableText, markdownDraft, markdownEditing, markdownSourceMode, persistMarkdownEditorViewState, readOnly])
+
+  const updateMarkdownDraft = React.useCallback((draft: string) => {
+    updateMarkdownEditorViewState((state) => ({ ...state, draft }))
+    setMarkdownDraft(draft)
+  }, [updateMarkdownEditorViewState])
+
+  const reconcileCleanMarkdownEditorContent = React.useCallback((content: string) => {
+    if (!markdownEditingRef.current || !isEditableText || readOnly) return
+    const currentState = getMarkdownEditorViewState(sessionId, markdownEditorCacheKey) ?? markdownEditorStateRef.current
+    if (currentState.draft !== currentState.lastSavedDraft || currentState.draft === content) return
+    const nextState: MarkdownEditorViewState = {
+      ...currentState,
+      draft: content,
+      lastSavedDraft: content,
+    }
+    lastSavedDraftRef.current = content
+    persistMarkdownEditorViewState(nextState)
+    setMarkdownDraft(content)
+  }, [isEditableText, markdownEditorCacheKey, persistMarkdownEditorViewState, readOnly, sessionId])
+
+  const handleSourceScroll = React.useCallback((event: React.UIEvent<HTMLTextAreaElement>) => {
+    const { scrollTop, scrollLeft } = event.currentTarget
+    updateMarkdownEditorViewState((state) => ({
+      ...state,
+      sourceScroll: { top: scrollTop, left: scrollLeft },
+    }))
+  }, [updateMarkdownEditorViewState])
+
+  const handleSourceSelection = React.useCallback((event: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    const { selectionStart, selectionEnd } = event.currentTarget
+    updateMarkdownEditorViewState((state) => ({
+      ...state,
+      sourceSelection: { start: selectionStart, end: selectionEnd },
+    }))
+  }, [updateMarkdownEditorViewState])
+
+  // 主加载 effect：上下文变化（filePath/dirPath/gitRoot/previewOnly）时触发；
+  // 纯预览仅在该文件收到 watcher 事件、焦点校验变化或手动刷新时重新读盘。
+  // 命中缓存时跳过 loading 闪烁直接渲染；未命中走 IPC 拉取
+  React.useEffect(() => {
+    let cancelled = false
+
+    // 所有文件类型均可缓存（含 PDF/DOCX/Office/Image）
+    const cacheKey = previewOnly
+      ? getContentCacheKey('preview', previewContentVersion)
+      : getContentCacheKey('diff', refreshVersion)
+    const cached = getPreviewContentCache(cacheKey)
+    // 保存或窗口恢复触发 refreshVersion 时，仍在编辑的 Markdown 必须继续留在
+    // 当前 ProseMirror 实例中；后台读取可以更新预览缓存，但不能先挂载 loading
+    // 占位，从而卸载编辑器并丢失内层滚动和选区。
+    const preserveMarkdownEditor = Boolean(isEditableText && activeMarkdownEditing)
+
+    if (cached) {
+      // 命中：直接同步渲染，不闪
+      restoreScrollRef.current = !preserveMarkdownEditor
+      if (preserveMarkdownEditor) {
+        reconcileCleanMarkdownEditorContent(cached.newContent)
+      }
+      lastNewContentRef.current = cached.newContent
+      lastOldContentRef.current = cached.oldContent
+      setOldContent(cached.oldContent)
+      setNewContent(cached.newContent)
+      setOfficeHtml(cached.officeHtml ?? '')
+      setOfficeHtmlUrl(cached.officeHtmlUrl ?? '')
+      setOfficeText(cached.officeText ?? '')
+      setSpreadsheetGrid(cached.spreadsheetGrid ?? null)
+      setHtmlPreviewUrl(cached.htmlPreviewUrl ?? '')
+      setUnsupportedPreviewReason(cached.unsupportedPreviewReason ?? '')
+      setPreviewMetadata(cached.previewMetadata)
+      setPdfSrc(cached.pdfSrc ?? '')
+      setPdfZoom(100)
+      setImagePath(cached.imagePath ?? '')
+      setImageDataUrl(cached.imageDataUrl ?? '')
+      setImageZoom(0.25)
+      setImageNaturalSize({ w: 0, h: 0 })
+      setLoading(false)
+      return // 缓存命中，直接返回，不执行 load()
+    } else {
+      if (preserveMarkdownEditor) {
+        setLoading(false)
+      } else if (!isLegacyOffice || ext === '.doc') {
+        setLoading(true)
+      }
+      if (!preserveMarkdownEditor) {
+        setOldContent('')
+        setNewContent('')
+        setOfficeHtml('')
+        setOfficeHtmlUrl('')
+        setOfficeText('')
+        setSpreadsheetGrid(null)
+        setHtmlPreviewUrl('')
+        setUnsupportedPreviewReason('')
+        setPreviewMetadata(undefined)
+        setPdfSrc('')
+        setPdfZoom(100)
+        setImagePath('')
+        setImageDataUrl('')
+        setImageZoom(0.25)
+        setImageNaturalSize({ w: 0, h: 0 })
+        lastNewContentRef.current = ''
+        lastOldContentRef.current = ''
+      }
+      // 内容缓存被 LRU 淘汰但滚动位置仍在时（如切走会话后预览 Tab 重建），
+      // 也标记需要恢复，待 load() 重新拉取渲染后回到上次滚动位置。
+      if (!preserveMarkdownEditor && scrollPositionCache.has(scrollKey)) {
+        restoreScrollRef.current = true
+      }
+    }
+
+    async function load() {
+      const recordResolvedPreviewPath = (resolvedPath: string | undefined): void => {
+        if (!previewOnly || !resolvedPath) return
+        setPreviewResolvedPaths((previous) => {
+          if (previous.get(previewContentRefreshKey) === resolvedPath) return previous
+          const next = new Map(previous)
+          next.set(previewContentRefreshKey, resolvedPath)
+          return next
+        })
+      }
+
+      try {
+        let content = cached?.newContent ?? ''
+        let old = cached?.oldContent ?? ''
+        let htmlUrl = cached?.htmlPreviewUrl ?? ''
+
+        if (!cached) {
+          // 即使从「改动」列表点开，XLSX/PPTX 也应保留原有的 Office 内联预览。
+          if (isPsd) {
+            // PSD 是二进制：不读文本，只登记解析后的路径；渲染交给 PsdFilePreview
+            if (previewOnly) {
+              const resolvedPsd = await window.electronAPI.resolveFilePath(filePath, fileAccess)
+              if (cancelled) return
+              recordResolvedPreviewPath(resolvedPsd?.resolvedPath ?? resolvedPsd?.path)
+            }
+            return
+          }
+          if (isOfficePreview) {
+            if (previewOnly) {
+              const resolvedPreview = await window.electronAPI.resolveAndReadFile(filePath, fileAccess)
+              if (cancelled) return
+              recordResolvedPreviewPath(resolvedPreview?.resolvedPath)
+            }
+            const result = await window.electronAPI.officeToHtml(filePath, fileAccess)
+            if (cancelled) return
+            const html = DOMPurify.sanitize(result?.html ?? '')
+            const htmlUrl = result?.htmlUrl ?? ''
+            const text = result?.text ?? ''
+            if (result?.renderer === 'grid') {
+              const grid = result.grid ?? { reason: 'large' as const }
+              setSpreadsheetGrid(grid)
+              setOfficeText('')
+              setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', spreadsheetGrid: grid })
+              return
+            }
+            // 转换失败时主进程只返回 null（超过 50MB 上限 / 文件损坏 / OfficeCLI 与各回退
+            // 链路全挂），此前渲染层把两个 state 都置空后直接渲染 null——内容区一片空白、
+            // 只剩工具栏，Toast 弹一下就没了。维护者 2026-09-10 报的就是这个。改为复用
+            // 文本预览那套 UnsupportedFilePreview，给出原因并保留「用默认应用打开」。
+            if (!html && !htmlUrl) {
+              const reason = '此 Office 文件无法内联预览（可能超过 50 MB 上限、文件损坏或内部结构不受支持），请使用默认应用打开。'
+              setUnsupportedPreviewReason(reason)
+              setOfficeText(text)
+              setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', unsupportedPreviewReason: reason, officeText: text })
+              return
+            }
+            setOfficeHtml(html)
+            setOfficeHtmlUrl(htmlUrl)
+            setOfficeText(text)
+            setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', officeHtml: html, officeHtmlUrl: htmlUrl, officeText: text })
+            return
+          }
+          if (previewOnly) {
+            // 所有纯预览类型先记录主进程实际解析到的路径。相对路径的多个候选根
+            // 中只有这个路径能使 watcher 刷新当前正在展示的文件。
+            const resolvedPreview = await window.electronAPI.resolveAndReadFile(filePath, fileAccess)
+            if (cancelled) return
+            recordResolvedPreviewPath(resolvedPreview?.resolvedPath)
+
+            if (isPdf) {
+              const result = await window.electronAPI.preparePdfPreview(filePath, fileAccess)
+              if (cancelled) return
+              const src = result?.tmpHtmlUrl ?? ''
+              setPdfSrc(src)
+              setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', pdfSrc: src })
+              return
+            }
+            if (isImage) {
+              const resolved = await window.electronAPI.resolveFilePath(filePath, fileAccess)
+              if (cancelled) return
+              if (resolved) {
+                setImagePath(filePath)
+                setImageDataUrl(resolved.url)
+                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', imagePath: filePath, imageDataUrl: resolved.url })
+              } else {
+                setImagePath('')
+                setImageDataUrl('')
+                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', imagePath: '', imageDataUrl: '' })
+              }
+              return
+            }
+            if (isLegacyOffice) {
+              // 旧版二进制格式：.xls 走快速表格视图、.ppt 走逐页文字视图，二者都由内容区组件在后台线程解析，这里无事可做
+              if (ext !== '.doc') return
+              // .doc：主进程用 word-extractor 抽出文字与表格（超过 15MB 不在主进程解析）
+              const legacy = await window.electronAPI.officeToHtml(filePath, fileAccess)
+              if (cancelled) return
+              const legacyHtml = DOMPurify.sanitize(legacy?.html ?? '')
+              const legacyText = legacy?.text ?? ''
+              if (!legacyHtml) {
+                const reason = '此旧版 Word 文件无法内联预览（可能超过 15 MB、已加密或文件损坏），请使用默认应用打开。'
+                setUnsupportedPreviewReason(reason)
+                setPreviewMetadata(resolvedPreview?.metadata)
+                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', unsupportedPreviewReason: reason })
+                return
+              }
+              setOfficeHtml(legacyHtml)
+              setOfficeText(legacyText)
+              setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', officeHtml: legacyHtml, officeText: legacyText })
+              return
+            }
+            const result = resolvedPreview
+            if (result?.isBinary || result?.isTooLarge) {
+              const reason = result.isTooLarge
+                ? '此文本文件超过 5 MB，无法安全进行内联预览，请使用默认应用打开。'
+                : '此二进制或编码异常文件暂不支持内联预览，请使用默认应用打开。'
+              setUnsupportedPreviewReason(reason)
+              setPreviewMetadata(result.metadata)
+              setPreviewContentCache(cacheKey, {
+                oldContent: '',
+                newContent: '',
+                unsupportedPreviewReason: reason,
+                previewMetadata: result.metadata,
+              })
+              return
+            }
+            // 解析失败（null = 文件不存在）时给「未找到 + 完整路径」提示；
+            // 不写缓存，文件恢复后重新点开即自愈。超限/二进制已在上方分支拦截。
+            const loadState = classifyTextPreviewResult(result, filePath)
+            if (loadState.kind === 'unavailable') {
+              setUnsupportedPreviewReason(loadState.reason)
+              if (result) {
+                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', unsupportedPreviewReason: loadState.reason })
+              }
+              return
+            }
+            content = loadState.content
+            if (isHtml) {
+              // 红线：HTML 预览走我方自有 prepareHtmlPreview 链路（iframe sandbox 受限 URL）
+              const preview = await window.electronAPI.prepareHtmlPreview(filePath, fileAccess)
+              if (cancelled) return
+              htmlUrl = preview?.url ?? ''
+              setHtmlPreviewUrl(htmlUrl)
+            }
+          } else {
+            const result = await window.electronAPI.getDiffContents({ dirPath, filePath, gitRoot, sessionId, baseRef })
+            if (cancelled) return
+            content = result?.newContent ?? ''
+            old = result?.oldContent ?? ''
+          }
+
+          if (preserveMarkdownEditor) {
+            reconcileCleanMarkdownEditorContent(content)
+          }
+          lastNewContentRef.current = content
+          lastOldContentRef.current = old
+          setOldContent(old)
+          setNewContent(content)
+
+          if (cacheKey) setPreviewContentCache(cacheKey, { oldContent: old, newContent: content, htmlPreviewUrl: htmlUrl || undefined })
+        }
+
+        if (previewOnly && !MD_EXTS.has(ext) && content) {
+          if (!cancelled) setLoading(false)
+        }
+      } catch {
+        // 加载失败静默处理
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+
+    load()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePath, dirPath, gitRoot, previewOnly, previewContentRefreshKey, previewContentVersion, fileAccess, isPdf, isOfficePreview, isPsd, isLegacyOffice, isImage, isHtml, sessionId, ext, getContentCacheKey, setPreviewResolvedPaths])
+
+  // refreshVersion 触发的静默刷新：仅 diff 模式、内容有变化时才更新 state
+  const prevRefreshRef = React.useRef(-1)
+  React.useEffect(() => {
+    if (previewOnly) return
+    // 首次跳过（避免首屏加载时和主 effect 重复拉取）
+    if (prevRefreshRef.current === -1) {
+      prevRefreshRef.current = refreshVersion
+      return
+    }
+    if (prevRefreshRef.current === refreshVersion) return
+    prevRefreshRef.current = refreshVersion
+
+    let cancelled = false
+    async function refresh() {
+      try {
+        const result = await window.electronAPI.getDiffContents({ dirPath, filePath, gitRoot, sessionId })
+        if (cancelled || !result) return
+        const newC = result.newContent ?? ''
+        const oldC = result.oldContent ?? ''
+        // 用新 refreshVersion 写入缓存，让后续切走再切回来能命中
+        setPreviewContentCache(getContentCacheKey('diff', refreshVersion), { oldContent: oldC, newContent: newC })
+        if (newC === lastNewContentRef.current && oldC === lastOldContentRef.current) return
+        lastNewContentRef.current = newC
+        lastOldContentRef.current = oldC
+        setNewContent(newC)
+        setOldContent(oldC)
+      } catch {
+        // ignore
+      }
+    }
+    refresh()
+    return () => { cancelled = true }
+  }, [refreshVersion, previewOnly, filePath, dirPath, gitRoot, sessionId, getContentCacheKey])
+
+  // diff 模式：内容加载完成后若新旧一致（无差异），通知父组件关闭预览面板
+  const emptyDiffFiredRef = React.useRef(false)
+  React.useEffect(() => {
+    emptyDiffFiredRef.current = false
+  }, [filePath, sessionId])
+  React.useEffect(() => {
+    if (previewOnly || isOfficePreview || isPsd || loading || emptyDiffFiredRef.current) return
+    if (oldContent === newContent) {
+      emptyDiffFiredRef.current = true
+      onEmptyDiff?.()
+    }
+  }, [previewOnly, isOfficePreview, loading, oldContent, newContent, onEmptyDiff])
+
+  // previewOnly 模式：加载完成后若内容无法预览，弹 Toast 通知用户
+  const toastedPreviewFailRef = React.useRef('')
+  React.useEffect(() => {
+    if ((!previewOnly && !isOfficePreview) || loading) return
+    const key = `${filePath}:${ext}`
+    if (toastedPreviewFailRef.current === key) return
+    let message: string | null = null
+    if (isLegacyOffice && ext === '.doc' && !officeHtml) {
+      message = '无法加载 DOC 预览'
+    } else if (isPdf && !pdfSrc) {
+      message = 'PDF 文件过大，无法在此预览'
+    } else if (isOfficePreview && !officeHtml && !officeHtmlUrl && !spreadsheetGrid) {
+      message = `无法加载 ${ext === '.pptx' ? 'PPTX' : ext === '.docx' ? 'DOCX' : 'Excel'} 预览`
+    } else if (isImage && !imageDataUrl) {
+      message = '图片文件过大，无法在此预览'
+    }
+    if (message) {
+      toastedPreviewFailRef.current = key
+      toast.warning(message)
+    }
+  }, [previewOnly, isOfficePreview, loading, filePath, ext, isLegacyOffice, isPdf, pdfSrc, officeHtml, officeHtmlUrl, spreadsheetGrid, isImage, imageDataUrl])
+
+  // scrollPosition persistent: module-level Map scoped by session, file path, and resolution context
+  // content changes (refreshVersion bump) → delete stored position;
+  // cached mount → restore; scroll → save.
+  const prevRefreshVersionRef = React.useRef(refreshVersion)
+  const restoreScrollRef = React.useRef(false)
+  const restoreRafRef = React.useRef(0)
+
+  const handleLiveMarkdownReady = React.useCallback(() => {
+    // Live Markdown 异步挂载前外层没有可恢复的内容高度，首轮恢复会被浏览器钳制到 0。
+    // 只有编辑器就绪后重新设置标记，才会在真实内容高度上恢复原阅读位置。
+    if (!scrollPositionCache.has(scrollKey)) return
+    restoreScrollRef.current = true
+    setPreviewScrollRestoreVersion((version) => version + 1)
+  }, [scrollKey])
+
+  // WHEN content version changes (refreshVersion bump): delete stored scroll position
+  // 只在内容变化时清除，切换文件时保留位置以支持返回导航。正在编辑的 Markdown
+  // 由独立内层滚动容器维护，refresh 不应把它当作新文档重置。
+  React.useEffect(() => {
+    if (loading) return // still loading, don't clear yet
+    if (prevRefreshVersionRef.current !== refreshVersion) {
+      prevRefreshVersionRef.current = refreshVersion
+      if (isEditableText && activeMarkdownEditing) return
+      if (preserveScrollOnNextRefreshRef.current) {
+        preserveScrollOnNextRefreshRef.current = false
+        return
+      }
+      scrollPositionCache.delete(scrollKey)
+      restoreScrollRef.current = false
+    }
+  }, [scrollKey, refreshVersion, loading, isEditableText])
+
+  React.useEffect(() => {
+    const position = pendingPreviewScrollRestoreRef.current
+    if (!position) return
+    pendingPreviewScrollRestoreRef.current = null
+    scrollPositionCache.set(scrollKey, position)
+    restoreScrollRef.current = true
+  }, [previewScrollRestoreVersion, scrollKey])
+
+  // RESTORE scroll position after cached content renders.
+  // 等待滚动容器内容高度连续 3 帧稳定后再恢复，避免异步渲染
+  // （Shiki tokenize、ProseMirror mount）导致高度变化引起滚动偏移。
+  React.useEffect(() => {
+    if (loading || !restoreScrollRef.current) return
+
+    const pos = scrollPositionCache.get(scrollKey)
+    if (!pos || !scrollContainerRef.current) {
+      restoreScrollRef.current = false
+      return
+    }
+
+    const el = scrollContainerRef.current
+    let prevHeight = el.scrollHeight
+    let stableFrames = 0
+
+    const check = () => {
+      const curHeight = el.scrollHeight
+      if (curHeight === prevHeight) {
+        stableFrames++
+      } else {
+        stableFrames = 0
+        prevHeight = curHeight
+      }
+      if (stableFrames >= 3) {
+        restoreScrollRef.current = false
+        el.scrollTop = pos.top
+        el.scrollLeft = pos.left
+        restoreRafRef.current = 0
+        return
+      }
+      restoreRafRef.current = requestAnimationFrame(check)
+    }
+
+    restoreRafRef.current = requestAnimationFrame(check)
+
+    return () => {
+      if (restoreRafRef.current) {
+        cancelAnimationFrame(restoreRafRef.current)
+        restoreRafRef.current = 0
+      }
+    }
+  }, [loading, previewScrollRestoreVersion, scrollKey])
+
+  // SAVE scroll position on scroll (throttled via rAF)
+  const scrollRafRef = React.useRef(0)
+  const handleScroll = React.useCallback(() => {
+    if (scrollRafRef.current) return
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0
+      const el = scrollContainerRef.current
+      if (el) {
+        const position = { top: el.scrollTop, left: el.scrollLeft }
+        scrollPositionCache.set(scrollKey, position)
+        if (isEditableText && !readOnly) {
+          updateMarkdownEditorViewState((state) => ({
+            ...state,
+            previewScroll: position,
+            // LiveMarkdown 的滚动由外层预览容器承接；编辑态离开后仍要恢复用户所在位置。
+            richScroll: activeMarkdownEditing && isMarkdown && !markdownSourceMode ? position : state.richScroll,
+          }))
+        }
+      }
+    })
+  }, [activeMarkdownEditing, isEditableText, isMarkdown, markdownSourceMode, readOnly, scrollKey, updateMarkdownEditorViewState])
+
+  // Cleanup rAF on unmount to prevent stale writes
+  React.useEffect(() => {
+    return () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+      if (restoreRafRef.current) cancelAnimationFrame(restoreRafRef.current)
+    }
+  }, [])
+
+  const handleCopy = React.useCallback(async () => {
+    try {
+      const copyText = activeMarkdownEditing ? markdownDraft : (isOfficePreview ? officeText : newContent)
+      await copyTextToClipboard(copyText)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // 复制失败
+    }
+  }, [activeMarkdownEditing, isOfficePreview, markdownDraft, newContent, officeText])
+
+
+  const startMarkdownEdit = React.useCallback(() => {
+    if (!isPlainTextEditable || readOnly) return
+    const currentEditorState = getMarkdownEditorViewState(sessionId, markdownEditorCacheKey) ?? markdownEditorStateRef.current
+    const hasPendingDraft = currentEditorState.draft !== currentEditorState.lastSavedDraft
+    const draft = hasPendingDraft ? currentEditorState.draft : newContent
+    const lastSavedDraft = hasPendingDraft ? currentEditorState.lastSavedDraft : newContent
+    const previewScroll = scrollContainerRef.current
+      ? { top: scrollContainerRef.current.scrollTop, left: scrollContainerRef.current.scrollLeft }
+      : currentEditorState.previewScroll
+    const nextEditorState: MarkdownEditorViewState = {
+      ...currentEditorState,
+      editing: true,
+      sourceMode: false,
+      draft,
+      lastSavedDraft,
+      previewScroll,
+      richScroll: { ...previewScroll },
+      sourceScroll: { ...previewScroll },
+      richSelection: null,
+      sourceSelection: null,
+    }
+    lastSavedDraftRef.current = lastSavedDraft
+    markdownEditingRef.current = true
+    persistMarkdownEditorViewState(nextEditorState)
+    setAutosaveStatus('idle')
+    setMarkdownSourceMode(false)
+    setMarkdownDraft(draft)
+    setMarkdownEditing(true)
+  }, [isPlainTextEditable, markdownEditorCacheKey, newContent, persistMarkdownEditorViewState, readOnly, sessionId])
+
+  // ref 形式的 persist：避免 callback / effect 因 refreshVersion 频繁变化而重建
+  const persistRef = React.useRef<(draft: string, fp: string, fa: typeof fileAccess, cacheKey: string) => Promise<boolean>>(async () => false)
+
+  const exitMarkdownEdit = React.useCallback(() => {
+    // 退出前 flush 待保存的草稿，避免用户在 debounce 窗口内退出时丢失输入。
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current)
+      autosaveTimerRef.current = null
+    }
+    const hasPendingSave = markdownDraft !== lastSavedDraftRef.current
+    if (hasPendingSave) preserveScrollOnNextRefreshRef.current = true
+    if (hasPendingSave) {
+      void persistRef.current(markdownDraft, filePath, fileAccess, markdownEditorCacheKey)
+    }
+
+    const sourceTextarea = sourceTextareaRef.current
+    const sourceScroll = sourceTextarea
+      ? { top: sourceTextarea.scrollTop, left: sourceTextarea.scrollLeft }
+      : markdownEditorStateRef.current.sourceScroll
+    const sourceSelection = sourceTextarea
+      ? { start: sourceTextarea.selectionStart, end: sourceTextarea.selectionEnd }
+      : markdownEditorStateRef.current.sourceSelection
+    const activeScroll = isMarkdown && !markdownSourceMode
+      ? markdownEditorStateRef.current.richScroll
+      : sourceScroll
+    const nextEditorState: MarkdownEditorViewState = {
+      ...markdownEditorStateRef.current,
+      editing: false,
+      sourceMode: false,
+      draft: markdownDraft,
+      lastSavedDraft: lastSavedDraftRef.current,
+      previewScroll: { ...activeScroll },
+      sourceScroll,
+      sourceSelection,
+    }
+
+    persistMarkdownEditorViewState(nextEditorState)
+    pendingPreviewScrollRestoreRef.current = { ...activeScroll }
+    setPreviewScrollRestoreVersion((version) => version + 1)
+    markdownEditingRef.current = false
+    setMarkdownSourceMode(false)
+    setMarkdownEditing(false)
+    setAutosaveStatus('idle')
+  }, [fileAccess, filePath, isMarkdown, markdownDraft, markdownEditorCacheKey, markdownSourceMode, persistMarkdownEditorViewState])
+
+  // 写盘核心：不退出编辑模式，被 autosave、saveMarkdownEdit、flush 共用。
+  // 接收显式参数（不依赖闭包），保证切换文件后 flush 用旧文件路径。
+  // 同一份 draft 重复触发会被 `draft === lastSavedDraftRef.current` 短路，
+  // 因此 autosave timer 与 unmount cleanup 偶发的双重 fire 不会真的写两次。
+  const persistMarkdownDraft = React.useCallback((
+    draft: string,
+    fp: string,
+    fa: typeof fileAccess,
+    editorCacheKey: string,
+  ): Promise<boolean> => {
+    const targetSessionId = fa.sessionId ?? sessionId
+    const saveOwner: MarkdownEditorOwner = {
+      sessionId: targetSessionId,
+      cacheKey: editorCacheKey,
+      generation: ownerGeneration,
+      sessionEpoch: getMarkdownEditorStateSessionEpoch(targetSessionId),
+    }
+    const run = async (): Promise<boolean> => {
+      const isLiveOwner = (): boolean => componentMountedRef.current
+        && isMarkdownEditorOwnerCurrent(saveOwner, markdownOwnerRef.current)
+      const isCurrentOwner = isLiveOwner()
+      const cachedState = getMarkdownEditorViewState(targetSessionId, editorCacheKey)
+      if (draft === (cachedState?.lastSavedDraft ?? (isCurrentOwner ? lastSavedDraftRef.current : undefined))) {
+        return true
+      }
+      if (isCurrentOwner) setAutosaveStatus('saving')
+      try {
+        const ok = await window.electronAPI.writeTextFile(fp, draft, fa)
+        // 文件写入必须保留，但过期 owner 不能再触碰新组件的 UI、refresh 或缓存。
+        if (!isLiveOwner()) return ok
+        if (!ok) {
+          setAutosaveStatus('error')
+          return false
+        }
+
+        lastSavedDraftRef.current = draft
+        const nextEditorState: MarkdownEditorViewState = {
+          ...markdownEditorStateRef.current,
+          lastSavedDraft: draft,
+        }
+        persistMarkdownEditorViewState(nextEditorState)
+        lastNewContentRef.current = draft
+        lastOldContentRef.current = ''
+        setOldContent('')
+        setNewContent(draft)
+        const nextPreviewContentVersion = previewContentVersion + 1
+        setPreviewContentCache(getContentCacheKey('preview', nextPreviewContentVersion), { oldContent: '', newContent: draft })
+        setPreviewContentRefreshVersionMap((prev) => {
+          const m = new Map(prev)
+          m.set(previewContentRefreshKey, nextPreviewContentVersion)
+          return m
+        })
+        setAutosaveStatus('saved')
+        return true
+      } catch (err) {
+        console.error('[DiffTabContent] Markdown save failed:', err)
+        if (isLiveOwner()) setAutosaveStatus('error')
+        return false
+      }
+    }
+
+    return enqueueMarkdownEditorSave(targetSessionId, editorCacheKey, run)
+  }, [componentMountedRef, getContentCacheKey, markdownEditorCacheKey, ownerGeneration, persistMarkdownEditorViewState, previewContentRefreshKey, previewContentVersion, setPreviewContentRefreshVersionMap, sessionId])
+
+
+  const saveMarkdownEdit = React.useCallback(async () => {
+    if (!isEditableText || readOnly || markdownSaving) return
+    // 立即保存只抢占 debounce，不改变编辑模式或当前滚动位置。
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current)
+      autosaveTimerRef.current = null
+    }
+    setMarkdownSaving(true)
+    const ok = await persistMarkdownDraft(markdownDraft, filePath, fileAccess, markdownEditorCacheKey)
+    if (!componentMountedRef.current || markdownOwnerRef.current.generation !== ownerGeneration) return
+    setMarkdownSaving(false)
+    if (!ok) {
+      window.alert('保存失败：没有写入权限或文件不存在')
+    }
+  }, [componentMountedRef, fileAccess, filePath, isEditableText, markdownDraft, markdownEditorCacheKey, markdownSaving, ownerGeneration, persistMarkdownDraft, readOnly])
+
+
+  const handleManualRefresh = React.useCallback(() => {
+    if (previewOnly) {
+      // 刷新是用户要求以磁盘内容为准，不能因恰好命中某个历史 version 的缓存而无效
+      clearPreviewContentCacheForFile(sessionId, filePath)
+      setPreviewContentRefreshVersionMap((prev) => {
+        const m = new Map(prev)
+        m.set(previewContentRefreshKey, (prev.get(previewContentRefreshKey) ?? 0) + 1)
+        return m
+      })
+      return
+    }
+
+    setRefreshVersionMap((prev) => {
+      const m = new Map(prev)
+      m.set(sessionId, (prev.get(sessionId) ?? 0) + 1)
+      return m
+    })
+  }, [filePath, previewContentRefreshKey, previewOnly, sessionId, setPreviewContentRefreshVersionMap, setRefreshVersionMap])
+
+  const handleAddSelectionToAgent = React.useCallback(() => {
+    if (!previewSelection) return
+    const quote = {
+      text: previewSelection.text,
+      filePath: previewSelection.filePath,
+      sourceType: 'file' as const,
+      sourceLabel: previewSelection.filePath,
+      capturedAt: Date.now(),
+    }
+    // 与 Agent 历史选区相同：直接向 RichTextInput 插入 chip，因而可多次引用并与草稿共存。
+    // 仅在输入框尚未挂载的非常规场景回退旧的单条引用状态。
+    if (!insertAgentInputQuote(sessionId, quote)) {
+      setQuotedSelectionMap((prev) => new Map(prev).set(sessionId, quote))
+    }
+    window.getSelection()?.removeAllRanges()
+    clearPreviewSelection()
+    focusAgentSessionInput(sessionId)
+  }, [clearPreviewSelection, focusAgentSessionInput, previewSelection, sessionId, setQuotedSelectionMap])
+
+  const handleOpenSelectionChat = React.useCallback(async (): Promise<void> => {
+    if (!previewSelection || openSelectionChatPendingRef.current) return
+
+    const quote = {
+      text: previewSelection.text,
+      filePath: previewSelection.filePath,
+      sourceType: 'file' as const,
+      sourceLabel: previewSelection.filePath,
+      capturedAt: Date.now(),
+    }
+    const activeConversationId = sideChatMap.get(sessionId) ?? null
+    // 右侧已绑定有效 Chat 时始终复用，避免因激活 Tab 状态短暂不同步而重复创建会话。
+    if (activeConversationId) {
+      setChatQuotedSelectionMap((previous) => new Map(previous).set(activeConversationId, quote))
+      setSidePanelOpen(true)
+      setSidePanelTabMap((previous) => new Map(previous).set(sessionId, 'chat'))
+      window.getSelection()?.removeAllRanges()
+      clearPreviewSelection()
+      focusChatInput(activeConversationId)
+      return
+    }
+
+    openSelectionChatPendingRef.current = true
+    try {
+      const conversation = await getOrCreateSideChat(sessionId, () => window.electronAPI.createConversation(
+        '预览选区问答',
+        selectedChatModel?.modelId,
+        selectedChatModel?.channelId,
+      ))
+      setConversations((prev) => prev.some((item) => item.id === conversation.id) ? prev : [conversation, ...prev])
+      setConversationDrafts((prev) => new Map(prev).set(conversation.id, '我的问题：'))
+      setSideChatMap((prev) => new Map(prev).set(sessionId, conversation.id))
+      setSidePanelOpen(true)
+      setSidePanelTabMap((prev) => new Map(prev).set(sessionId, 'chat'))
+      setChatQuotedSelectionMap((previous) => new Map(previous).set(conversation.id, quote))
+      window.getSelection()?.removeAllRanges()
+      clearPreviewSelection()
+      focusChatInput(conversation.id)
+    } catch (error) {
+      console.error('[DiffTabContent] 打开预览选区聊天标签失败:', error)
+      toast.error('打开右侧问答失败')
+    } finally {
+      openSelectionChatPendingRef.current = false
+    }
+  }, [
+    clearPreviewSelection,
+    conversations,
+    previewSelection,
+    selectedChatModel,
+    sessionId,
+    setConversationDrafts,
+    setConversations,
+    setChatQuotedSelectionMap,
+    setQuotedSelectionMap,
+    setSideChatMap,
+    setSidePanelOpen,
+    setSidePanelTabMap,
+    sideChatMap,
+  ])
+
+  // persistRef 始终持有最新 persistMarkdownDraft，供 setTimeout / unmount cleanup 调用。
+  // 用 effect 而非渲染期赋值，避免 React 19 严格模式下并发渲染中途读到中间态。
+  React.useEffect(() => {
+    persistRef.current = persistMarkdownDraft
+  }, [persistMarkdownDraft])
+
+  React.useLayoutEffect(() => {
+    if (loading || !activeMarkdownEditing || (isMarkdown && !markdownSourceMode)) return
+    const textarea = sourceTextareaRef.current
+    if (!textarea) return
+
+    const { sourceScroll, sourceSelection } = markdownEditorStateRef.current
+    const frameId = requestAnimationFrame(() => {
+      textarea.scrollTop = sourceScroll.top
+      textarea.scrollLeft = sourceScroll.left
+      if (sourceSelection) {
+        const start = Math.max(0, Math.min(sourceSelection.start, textarea.value.length))
+        const end = Math.max(start, Math.min(sourceSelection.end, textarea.value.length))
+        textarea.setSelectionRange(start, end)
+      }
+    })
+    return () => cancelAnimationFrame(frameId)
+  }, [filePath, isMarkdown, loading, activeMarkdownEditing, markdownSourceMode, sessionId])
+
+  // 自动保存：编辑模式下停止输入 1.5s 后写盘。
+  // timer 所有权：autosave effect 创建并在 cleanup 中清；saveMarkdownEdit / exitMarkdownEdit
+  // 也会主动清以抢占 debounce。多处清理都是幂等的（设 null 后再清是 no-op）。
+  React.useEffect(() => {
+    if (!activeMarkdownEditing || !isEditableText || readOnly) return
+    if (markdownDraft === lastSavedDraftRef.current) return
+    if (autosaveTimerRef.current !== null) {
+      window.clearTimeout(autosaveTimerRef.current)
+    }
+    const draftSnapshot = markdownDraft
+    const fpSnapshot = filePath
+    const faSnapshot = fileAccess
+    const editorCacheKeySnapshot = markdownEditorCacheKey
+    autosaveTimerRef.current = window.setTimeout(() => {
+      autosaveTimerRef.current = null
+      void persistRef.current(draftSnapshot, fpSnapshot, faSnapshot, editorCacheKeySnapshot)
+    }, 1500)
+    return () => {
+      if (autosaveTimerRef.current !== null) {
+        window.clearTimeout(autosaveTimerRef.current)
+        autosaveTimerRef.current = null
+      }
+    }
+  }, [markdownDraft, activeMarkdownEditing, isEditableText, filePath, fileAccess, markdownEditorCacheKey, readOnly])
+
+
+  // saved → 1.5s 后回到 idle，避免指示器一直停在"已保存"
+  React.useEffect(() => {
+    if (autosaveStatus !== 'saved') return
+    const id = window.setTimeout(() => setAutosaveStatus('idle'), 1500)
+    return () => window.clearTimeout(id)
+  }, [autosaveStatus])
+
+  // 切换文件 / scope / 只读生命周期时，cleanup 必须绑定创建它的不可变 owner。
+  // 最新 draft、滚动和选区优先从按 owner 保存的 cache 读取，避免旧 render 快照覆盖事件后的 ref。
+  React.useEffect(() => {
+    const cleanupOwner = markdownOwnerRef.current
+    const cleanupFilePath = filePath
+    const cleanupFileAccess = fileAccess
+    const cleanupIsEditableText = isEditableText
+    const cleanupReadOnly = Boolean(readOnly)
+    componentMountedRef.current = true
+
+    return () => {
+      if (autosaveTimerRef.current !== null) {
+        window.clearTimeout(autosaveTimerRef.current)
+        autosaveTimerRef.current = null
+      }
+      if (markdownOwnerRef.current.generation === cleanupOwner.generation) {
+        componentMountedRef.current = false
+      }
+      if (cleanupReadOnly || !cleanupIsEditableText) return
+
+      if (getMarkdownEditorStateSessionEpoch(cleanupOwner.sessionId) !== cleanupOwner.sessionEpoch) return
+      const cachedState = getMarkdownEditorViewState(cleanupOwner.sessionId, cleanupOwner.cacheKey)
+      const ownerState = cachedState
+        ?? (markdownEditorStateOwnerRef.current.sessionId === cleanupOwner.sessionId
+          && markdownEditorStateOwnerRef.current.cacheKey === cleanupOwner.cacheKey
+          ? markdownEditorStateRef.current
+          : createMarkdownEditorViewState())
+      const sourceTextarea = sourceTextareaRef.current
+      const latestState = sourceTextarea
+        ? {
+            ...ownerState,
+            sourceScroll: { top: sourceTextarea.scrollTop, left: sourceTextarea.scrollLeft },
+            sourceSelection: { start: sourceTextarea.selectionStart, end: sourceTextarea.selectionEnd },
+          }
+        : ownerState
+      const dirty = latestState.draft !== latestState.lastSavedDraft
+      setMarkdownEditorViewState(cleanupOwner.sessionId, cleanupOwner.cacheKey, latestState)
+      if (latestState.editing && dirty) {
+        void persistMarkdownDraft(latestState.draft, cleanupFilePath, cleanupFileAccess, cleanupOwner.cacheKey)
+      }
+    }
+    // 只在 owner/readOnly 生命周期变化时执行；cleanup 内部读取 owner cache 的最新快照。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filePath, fileAccess, isEditableText, markdownEditorCacheKey, readOnly, sessionId])
+
+  const previewTargetPath = getPreviewTargetPath(filePath, dirPath)
+  const handleOpenCurrentFolder = React.useCallback(() => {
+    window.electronAPI.systemOpenFile(getParentFolderPath(previewTargetPath), undefined, fileAccess).catch((error) => {
+      console.error('[DiffTabContent] 打开当前文件夹失败:', error)
+      toast.error('无法打开当前文件夹')
+    })
+  }, [fileAccess, previewTargetPath])
+
+  return (
+    <div className="flex flex-col h-full">
+      {/*
+        这一行只放操作按钮，不再重复文件名——标签栏已经写了一次（同样是 basename），
+        Office 预览里 OfficeCLI 还会再写第三次，用户反馈「一个文件三个菜单栏」。
+        全路径提示改挂到标签的 title 上（见 DiffPanelTabBar 的 tab.title），
+        这里用 flex-1 的空占位把按钮推到右端，行高与各类预览保持一致。
+      */}
+      <div className="flex items-center gap-2 px-3 py-1.5 flex-shrink-0">
+        <div className="min-w-0 flex-1" />
+
+        {previewOnly && (
+          <>
+            <DefaultAppOpenButton
+              filePath={previewTargetPath}
+              access={fileAccess}
+              variant="labeled"
+            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={handleOpenCurrentFolder}
+                  className="flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                  aria-label="打开当前文件夹"
+                >
+                  <FolderOpen className="size-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">打开当前文件夹</TooltipContent>
+            </Tooltip>
+          </>
+        )}
+
+        {!previewOnly && (
+          <div
+            className="relative flex rounded-lg bg-muted p-0.5 shrink-0 ml-auto cursor-pointer select-none"
+            onClick={() => setViewMode((v) => v === 'split' ? 'unified' : 'split')}
+          >
+            <div
+              className={cn(
+                'absolute top-0.5 bottom-0.5 w-[calc(50%-2px)] rounded-md bg-background shadow-sm transition-transform duration-200 ease-in-out',
+                viewMode === 'unified' ? 'translate-x-full' : 'translate-x-0',
+              )}
+            />
+            <span className={cn('relative z-[1] rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors',
+              viewMode === 'split' ? 'text-foreground' : 'text-muted-foreground')}>分栏</span>
+            <span className={cn('relative z-[1] rounded-md px-2 py-0.5 text-[11px] font-medium transition-colors',
+              viewMode === 'unified' ? 'text-foreground' : 'text-muted-foreground')}>统一</span>
+          </div>
+        )}
+
+        {previewOnly && isHtml && (
+          <button
+            type="button"
+            onClick={() => setHtmlSourceMode((sourceMode) => !sourceMode)}
+            className="ml-auto p-1 rounded hover:bg-foreground/[0.06] text-foreground/40 hover:text-foreground/60 shrink-0"
+            title={htmlSourceMode ? '切换到渲染预览' : '切换到源码预览'}
+            aria-label={htmlSourceMode ? '切换到渲染预览' : '切换到源码预览'}
+          >
+            {htmlSourceMode ? <Eye className="size-3.5" /> : <Code2 className="size-3.5" />}
+          </button>
+        )}
+
+        {previewOnly && isPlainTextEditable && !readOnly && (
+          markdownEditing ? (
+            <div className="ml-auto flex items-center gap-1">
+              <button
+                type="button"
+                onClick={exitMarkdownEdit}
+                disabled={markdownSaving}
+                className="p-1 rounded hover:bg-foreground/[0.06] text-foreground/40 hover:text-foreground/60 disabled:opacity-50 shrink-0"
+                title="退出编辑"
+              >
+                <X className="size-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void saveMarkdownEdit()}
+                disabled={markdownSaving}
+                className={cn(
+                  'p-1 rounded hover:bg-foreground/[0.06] disabled:opacity-50 shrink-0 transition-colors duration-300',
+                  autosaveStatus === 'saved' && 'text-success hover:text-success',
+                  autosaveStatus === 'error' && 'text-danger hover:text-danger',
+                  autosaveStatus !== 'saved' && autosaveStatus !== 'error' && 'text-foreground/40 hover:text-foreground/60',
+                )}
+                title={
+                  autosaveStatus === 'error'
+                    ? '自动保存失败，点击重试'
+                    : autosaveStatus === 'saved'
+                      ? '已保存'
+                      : '立即保存'
+                }
+              >
+                <Save className="size-3.5" />
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={startMarkdownEdit}
+              className="ml-auto p-1 rounded hover:bg-foreground/[0.06] text-foreground/40 hover:text-foreground/60 shrink-0"
+              title="编辑文本"
+            >
+              <Pencil className="size-3.5" />
+            </button>
+          )
+        )}
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={handleCopy}
+              className={cn('p-1 rounded hover:bg-foreground/[0.06] text-foreground/40 hover:text-foreground/60 shrink-0', previewOnly && !isEditableText && 'ml-auto')}
+              aria-label={copied ? '已复制文件内容' : '复制文件内容'}
+            >
+              {copied ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />}
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{copied ? '已复制文件内容' : '复制文件内容'}</TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={handleManualRefresh}
+              className="p-1 rounded hover:bg-foreground/[0.06] text-foreground/40 hover:text-foreground/60 shrink-0"
+              aria-label="刷新文件内容（检测外部编辑器的修改）"
+            >
+              <RotateCw className="size-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">刷新文件内容（检测外部编辑器的修改）</TooltipContent>
+        </Tooltip>
+
+        {canTogglePreviewWrap && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setCodeWrap((v) => !v)}
+                className={cn(
+                  'p-1 rounded hover:bg-foreground/[0.06] shrink-0',
+                  codeWrap ? 'text-foreground/70' : 'text-foreground/40 hover:text-foreground/60',
+                )}
+                aria-label={previewWrapLabel}
+              >
+                <WrapText className="size-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              <p>{previewWrapLabel}</p>
+            </TooltipContent>
+          </Tooltip>
+        )}
+
+        {isMarkdown && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setTocOpen((v) => !v)}
+                className={cn(
+                  'p-1 rounded hover:bg-foreground/[0.06] shrink-0',
+                  tocOpen ? 'text-foreground/70' : 'text-foreground/40 hover:text-foreground/60',
+                )}
+                aria-label={tocOpen ? '隐藏目录' : '显示目录'}
+              >
+                <List className="size-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{tocOpen ? '隐藏目录' : '显示目录'}</TooltipContent>
+          </Tooltip>
+        )}
+
+        {toolbarActions}
+      </div>
+
+      <div className="relative flex-1 min-h-0 flex">
+        <PreviewFindBar
+          open={findOpen}
+          rootRef={scrollContainerRef}
+          contentKey={findContentKey}
+          provider={pdfFindProvider ?? gridFindProvider}
+          onOpenChange={setFindOpen}
+        />
+        <MarkdownToc
+          containerRef={scrollContainerRef}
+          contentKey={tocContentKey}
+          enabled={Boolean(isMarkdown && tocOpen)}
+          onOpenChange={setTocOpen}
+          source={isMarkdown ? { headings: tocSourceHeadings, activeId: tocActiveId, onNavigate: navigateToTocHeading } : undefined}
+        />
+        {isMarkdown && !tocOpen && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={() => setTocOpen(true)}
+                className="mx-2 mb-2 mt-4 flex size-7 shrink-0 items-center justify-center self-start rounded-md bg-muted/40 text-foreground/45 hover:bg-foreground/[0.06] hover:text-foreground/70"
+                aria-label="展开目录"
+              >
+                <ChevronRight className="size-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right">展开目录</TooltipContent>
+          </Tooltip>
+        )}
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className={cn(
+            'h-full flex-1 min-w-0 scrollbar-thin relative',
+            // Office 高保真 iframe 与快速表格视图自己管滚动；外层再滚会出现双滚动条
+            isOfficePreview || isPsd || (isLegacyOffice && ext === '.xls') ? 'overflow-hidden' : 'overflow-auto',
+          )}
+        >
+          {loading ? (
+            <div className="flex items-center justify-center h-full text-muted-foreground text-[12px]">加载中...</div>
+          ) : (previewOnly || isOfficePreview || isPsd) ? (
+            unsupportedPreviewReason ? (
+              <UnsupportedFilePreview
+                filePath={previewTargetPath}
+                access={fileAccess}
+                reason={unsupportedPreviewReason}
+                metadata={previewMetadata}
+              />
+            ) : isPdf ? (
+              pdfSrc ? (
+                <div className="relative h-full">
+                {/* 查找栏打开时让到它下方：窄面板里两者同在顶部会互相遮挡 */}
+                <div className={cn('absolute left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 px-2 py-1 rounded-lg bg-background/80 backdrop-filter backdrop-blur-sm border border-border/30 shadow-sm', findOpen ? 'top-12' : 'top-2')}>
+                  <button
+                    type="button"
+                    className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
+                    onClick={() => pdfIframeRef.current?.contentWindow?.postMessage({ type: 'pdf-zoom', direction: 'out' }, '*')}
+                  >−</button>
+                  <span className="text-xs text-muted-foreground min-w-[40px] text-center font-mono">{pdfZoom}%</span>
+                  <button
+                    type="button"
+                    className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
+                    onClick={() => pdfIframeRef.current?.contentWindow?.postMessage({ type: 'pdf-zoom', direction: 'in' }, '*')}
+                  >+</button>
+                </div>
+                <iframe
+                  ref={pdfIframeRef}
+                  src={pdfSrc}
+                  className="w-full h-full border-0"
+                  title={filePath.split('/').pop() || 'PDF'}
+                />
+              </div>
+              ) : null
+            ) : isImage ? (
+              imageDataUrl ? (
+                <div className="relative h-full">
+                <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 px-2 py-1 rounded-lg bg-background/80 backdrop-blur-sm border border-border/30 shadow-sm">
+                  <button
+                    type="button"
+                    className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
+                    onClick={() => setImageZoom((z) => Math.max(0.1, z / 1.5))}
+                  >−</button>
+                  <span className="text-xs text-muted-foreground min-w-[40px] text-center font-mono">{Math.round(imageZoom * 100)}%</span>
+                  <button
+                    type="button"
+                    className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
+                    onClick={() => setImageZoom((z) => Math.min(5, z * 1.5))}
+                  >+</button>
+                </div>
+                <div
+                  ref={imageContainerRef}
+                  className="h-full overflow-auto p-4 pt-12"
+                  style={{ cursor: imageZoom > 1 ? (imageDragging.current ? 'grabbing' : 'grab') : 'default' }}
+                  onMouseDown={(e) => {
+                    if (imageZoom <= 1 || e.button !== 0) return
+                    imageDragging.current = true
+                    imageDragStart.current = { x: e.clientX, y: e.clientY, scrollLeft: e.currentTarget.scrollLeft, scrollTop: e.currentTarget.scrollTop }
+                    e.currentTarget.style.cursor = 'grabbing'
+                    const target = e.currentTarget
+                    const onMove = (ev: MouseEvent) => {
+                      if (!imageDragging.current) return
+                      target.scrollLeft = imageDragStart.current.scrollLeft - (ev.clientX - imageDragStart.current.x)
+                      target.scrollTop = imageDragStart.current.scrollTop - (ev.clientY - imageDragStart.current.y)
+                    }
+                    const onUp = () => {
+                      imageDragging.current = false
+                      target.style.cursor = 'grab'
+                      document.removeEventListener('mousemove', onMove)
+                      document.removeEventListener('mouseup', onUp)
+                    }
+                    document.addEventListener('mousemove', onMove)
+                    document.addEventListener('mouseup', onUp)
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minWidth: '100%', minHeight: '100%', width: imageNaturalSize.w > 0 ? imageNaturalSize.w * imageZoom : undefined, height: imageNaturalSize.h > 0 ? imageNaturalSize.h * imageZoom : undefined }}>
+                    <img
+                      src={imageDataUrl}
+                      alt={filePath.split('/').pop() || 'Image'}
+                      draggable={false}
+                      onLoad={(e) => {
+                        const img = e.currentTarget
+                        setImageNaturalSize({ w: img.naturalWidth, h: img.naturalHeight })
+                      }}
+                      style={{ width: imageNaturalSize.w > 0 ? imageNaturalSize.w * imageZoom : '100%', height: imageNaturalSize.h > 0 ? imageNaturalSize.h * imageZoom : 'auto', maxWidth: imageZoom <= 1 ? '100%' : 'none' }}
+                    />
+                  </div>
+                </div>
+              </div>
+              ) : null
+            ) : isPsd ? (
+              <PsdFilePreview filePath={filePath} fileAccess={fileAccess} />
+            ) : isOfficePreview ? (
+              spreadsheetGrid ? (
+                <SpreadsheetGridPreview
+                  filePath={filePath}
+                  fileAccess={fileAccess}
+                  source={spreadsheetGrid.reason}
+                  frozenPanes={spreadsheetGrid.frozenPanes}
+                  onFindProviderChange={setGridFindProvider}
+                />
+              ) : officeHtmlUrl ? (
+                <iframe
+                  src={officeHtmlUrl}
+                  className="office-preview-iframe"
+                  title={`${filePath.split('/').pop() || 'Office'} 高保真预览`}
+                  sandbox="allow-scripts"
+                  referrerPolicy="no-referrer"
+                />
+              ) : officeHtml ? (
+                <div
+                  className="office-preview-host"
+                  dangerouslySetInnerHTML={{ __html: officeHtml }}
+                />
+              ) : null
+            ) : isLegacyOffice ? (
+              // .xls / .ppt 不经主加载流程的「加载中」卸载，文件变化或手动刷新时靠 key 带上内容版本重新挂载、重新读盘
+              ext === '.xls' ? (
+                <SpreadsheetGridPreview key={`xls:${contentRefreshVersion}`} filePath={filePath} fileAccess={fileAccess} source="legacy" onFindProviderChange={setGridFindProvider} />
+              ) : ext === '.ppt' ? (
+                <LegacyPptPreview key={`ppt:${contentRefreshVersion}`} filePath={filePath} fileAccess={fileAccess} />
+              ) : officeHtml ? (
+                <div className="office-preview-host" dangerouslySetInnerHTML={{ __html: officeHtml }} />
+              ) : null
+            ) : isHtml && !htmlSourceMode ? (
+              htmlPreviewUrl ? (
+                <iframe
+                  src={htmlPreviewUrl}
+                  className="h-full w-full border-0 bg-white"
+                  title={`${filePath.split('/').pop() || 'HTML'} 渲染预览`}
+                  sandbox="allow-scripts allow-forms"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center px-6 text-center text-[13px] text-muted-foreground">
+                  无法加载 HTML 预览资源，请切换到源码预览或刷新后重试。
+                </div>
+              )
+            ) : isMarkdown ? (
+              <LiveMarkdownEditor
+                ref={liveMarkdownEditorRef}
+                key={readOnly ? 'readonly' : 'editable'}
+                value={readOnly ? newContent : markdownDraft}
+                onChange={updateMarkdownDraft}
+                onSave={() => void saveMarkdownEdit()}
+                onReady={handleLiveMarkdownReady}
+                onTextSelectionChange={handleLiveMarkdownSelectionChange}
+                readOnly={Boolean(readOnly)}
+                resolveImageSrc={resolveMarkdownImageSrc}
+                className="live-markdown-external-scroll"
+              />
+            ) : isPlainTextEditable && activeMarkdownEditing ? (
+              <textarea
+                ref={sourceTextareaRef}
+                value={markdownDraft}
+                onChange={(e) => updateMarkdownDraft(e.target.value)}
+                onScroll={handleSourceScroll}
+                onSelect={handleSourceSelection}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    e.preventDefault()
+                    exitMarkdownEdit()
+                  }
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault()
+                    void saveMarkdownEdit()
+                  }
+                }}
+                autoFocus
+                spellCheck={false}
+                className="w-full min-h-full resize-none border-0 bg-transparent px-4 py-3 font-mono text-[13px] leading-relaxed text-foreground outline-none focus:outline-none"
+              />
+            ) : newContent ? (
+              newContent.length > MAX_PREVIEW_CHARS ? (
+                <pre className="p-3 text-[13px] leading-relaxed text-foreground/80 font-mono whitespace-pre-wrap [overflow-wrap:anywhere]">
+                  {newContent.slice(0, MAX_PREVIEW_CHARS)}
+                  <span className="text-muted-foreground block mt-2">
+                    （文件过大，仅显示前 {MAX_PREVIEW_CHARS.toLocaleString()} 字符）
+                  </span>
+                </pre>
+              ) : (
+                <div className="h-full">
+                  <PierreFile file={pierreFile} options={pierreOptions} />
+                </div>
+              )
+            ) : (
+              <pre className="p-3 text-[13px] leading-relaxed text-foreground/80 font-mono whitespace-pre-wrap [overflow-wrap:anywhere]">
+                <span className="text-muted-foreground">（文件为空）</span>
+              </pre>
+            )
+          ) : (
+            <DiffView oldContent={oldContent} newContent={newContent} filePath={filePath} viewMode={viewMode} />
+          )}
+        </div>
+        {previewSelection && (
+          <SelectionActionPopover
+            x={previewSelection.x}
+            y={previewSelection.y}
+            onAddToAgent={handleAddSelectionToAgent}
+            onOpenChat={handleOpenSelectionChat}
+          />
+        )}
+      </div>
+    </div>
+  )
+}

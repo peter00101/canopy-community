@@ -1,0 +1,19 @@
+{
+  "id": "warm-sand",
+  "name": "暖沙",
+  "description": "人文杂志感：米色底、右上柔和大圆、底部细线。适合品牌故事、文化培训、生活方式内容。",
+  "canvas": { "w": 1280, "h": 720 },
+  "background": { "type": "svg", "file": "bg.svg" },
+  "safeArea": { "x": 40, "y": 110, "w": 1200, "h": 560 },
+  "titleBox": { "x": 40, "y": 40, "w": 900, "h": 60, "fontSize": 36 },
+  "footer": { "text": "{{deck_title}}", "x": 40, "y": 700, "pageNumber": { "x": 1240, "y": 700, "anchor": "end" } },
+  "colors": {
+    "bg": "#F6F1EA", "surface": "#FFFFFF", "text": "#3B2F2A", "muted": "#8C7B73",
+    "brand": "#C46A3C", "accent": "#6B7F52", "line": "#E6DCD2"
+  },
+  "fonts": {
+    "title": "Noto Serif CJK SC, Songti SC, SimSun, serif",
+    "body": "Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif"
+  },
+  "shape": { "radius": 24, "cardStroke": true, "decor": "corner-circle" }
+}

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 260" width="180" height="260">
+  <!-- 拿铁暖阳：暖米天空 + 焦糖暖阳 + 层叠奶咖沙丘 -->
+  <defs>
+    <linearGradient id="latte-sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4ead9"/>
+      <stop offset="1" stop-color="#ecdcc3"/>
+    </linearGradient>
+  </defs>
+  <rect width="180" height="260" fill="url(#latte-sky)"/>
+  <!-- 暖阳与光晕 -->
+  <circle cx="122" cy="74" r="46" fill="#e8c48f" opacity="0.45"/>
+  <circle cx="122" cy="74" r="30" fill="#dfa763"/>
+  <circle cx="122" cy="74" r="30" fill="#f3d9ad" opacity="0.35"/>
+  <!-- 远处飞鸟 -->
+  <path d="M38 62 q5 -5 10 0 M46 74 q4 -4 8 0" stroke="#a9825d" stroke-width="2" fill="none" stroke-linecap="round"/>
+  <!-- 三层沙丘：浅→深咖 -->
+  <path d="M0 150 Q45 118 92 142 T180 138 V260 H0 Z" fill="#dcc19b"/>
+  <path d="M0 182 Q60 150 110 172 T180 168 V260 H0 Z" fill="#c3a075"/>
+  <path d="M0 214 Q50 190 96 206 T180 202 V260 H0 Z" fill="#9c7449"/>
+  <!-- 沙丘脊线高光 -->
+  <path d="M0 150 Q45 118 92 142 T180 138" stroke="#f0e0c4" stroke-width="2.5" fill="none" opacity="0.8"/>
+  <path d="M0 182 Q60 150 110 172 T180 168" stroke="#e2c79c" stroke-width="2" fill="none" opacity="0.6"/>
+</svg>

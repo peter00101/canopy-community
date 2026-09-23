@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 260" width="180" height="260">
+  <!-- 青杉映雪：近白天光 + 淡青远山 + 层叠云杉剪影，色值取自 .theme-spruce-light -->
+  <defs>
+    <linearGradient id="spruce-light-sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fcfb"/>
+      <stop offset="1" stop-color="#dfeae7"/>
+    </linearGradient>
+    <linearGradient id="spruce-light-snow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4faf8"/>
+      <stop offset="1" stop-color="#e2ecea"/>
+    </linearGradient>
+  </defs>
+  <rect width="180" height="260" fill="url(#spruce-light-sky)"/>
+  <!-- 冬日低悬的淡光 -->
+  <circle cx="128" cy="62" r="34" fill="#cfe3de" opacity="0.55"/>
+  <circle cx="128" cy="62" r="19" fill="#eef6f4"/>
+  <!-- 淡青远山 -->
+  <path d="M0 138 Q34 108 66 132 Q96 154 124 128 Q152 104 180 130 V166 H0 Z" fill="#c6dbd6" opacity="0.75"/>
+  <!-- 雪地 -->
+  <path d="M0 166 Q46 154 92 164 T180 158 V260 H0 Z" fill="url(#spruce-light-snow)"/>
+  <!-- 后排云杉：浅青 -->
+  <path d="M42 168 L52 132 L62 168 Z" fill="#8fb5ae"/>
+  <path d="M44 152 L52 124 L60 152 Z" fill="#8fb5ae"/>
+  <path d="M138 170 L147 138 L156 170 Z" fill="#8fb5ae"/>
+  <path d="M140 156 L147 131 L154 156 Z" fill="#8fb5ae"/>
+  <!-- 前排云杉：深青绿主色 -->
+  <path d="M74 214 L92 150 L110 214 Z" fill="#2d7570"/>
+  <path d="M78 186 L92 138 L106 186 Z" fill="#2d7570"/>
+  <path d="M82 162 L92 128 L102 162 Z" fill="#2d7570"/>
+  <rect x="89" y="212" width="6" height="16" fill="#1f4f4c"/>
+  <!-- 侧旁小杉 -->
+  <path d="M20 206 L32 166 L44 206 Z" fill="#3d8880"/>
+  <path d="M24 184 L32 156 L40 184 Z" fill="#3d8880"/>
+  <rect x="29" y="204" width="5" height="12" fill="#2a5f5a"/>
+  <!-- 雪脊高光 -->
+  <path d="M0 166 Q46 154 92 164 T180 158" stroke="#ffffff" stroke-width="2.5" fill="none" opacity="0.85"/>
+  <path d="M0 200 Q54 190 108 198 T180 194" stroke="#ffffff" stroke-width="1.8" fill="none" opacity="0.5"/>
+</svg>

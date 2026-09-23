@@ -1,0 +1,1936 @@
+import { app, BrowserWindow, WebContentsView, session as electronSession, type DownloadItem, type Session, type WebContents } from 'electron'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import path, { join } from 'node:path'
+import { realpath, stat } from 'node:fs/promises'
+import type { BrowserDownloadItem, BrowserExecutionSource, BrowserOperationStatus, BrowserSearchEngineId, BrowserSessionClosed, BrowserTabFocusChange, BrowserTraceAction, BrowserTraceItem, BrowserViewLayout, BrowserViewState, BrowserTabState } from '@canopy/shared'
+import { AGENT_IPC_CHANNELS } from '@canopy/shared'
+import { getFaviconOrigin, shouldClearFaviconOnNavigate } from './browser-favicon-policy'
+import { getPopupChildrenToDispose } from './browser-popup-lifecycle'
+import { assertSafeBrowserDestination, assertSafeBrowserDownloadUrl, assertSafeBrowserUrl, getBrowserNewTabUrl, isSupportedBrowserPopupUrl, isTransientBrowserPopupUrl, setBrowserSearchEngine } from './browser-policy'
+import { MAX_BROWSER_DOWNLOAD_RECORDS, buildPdfExportFilename, getBrowserDownloadsDir, resolveUniqueFilename, sanitizeDownloadFilename, shouldCancelDownload } from './browser-download-policy'
+import { createAuthorizedPreviewUrl, isAuthorizedPreviewProtocol } from './browser-preview-service'
+import { handleAppFileRequest } from './local-file-protocol'
+import { BrowserCdpTimeoutError, BrowserOperationAbortedError, BROWSER_EVALUATE_TIMEOUT_MS, BROWSER_OBSERVE_TIMEOUT_MS, loadUrlToleratingSlowFinish, resolveBrowserObserveAxDepth, throwIfBrowserOperationAborted, withBrowserCdpTimeout } from './browser-cdp'
+import { parseBrowserPressAction } from './browser-key-policy'
+import { browserObservationNameLimit, prioritizeBrowserObservationCandidates, resolveBrowserObserveMaxElements } from './browser-observation-policy'
+import { buildPersistentBrowserPartition, resolveBrowserProfileKey } from './browser-profile-policy'
+import { canBrowserSessionTakeForeground, isNewBrowserTabLayoutRevision } from './browser-presentation-policy'
+import { hasAcknowledgedBrowserRiskDisclaimer } from './browser-risk-disclaimer'
+import { buildCanopyBrowserUserAgent } from './browser-identity'
+import {
+  assertBrowserExtract,
+  assertBrowserScript,
+  assertBrowserScroll,
+  assertBrowserSelectOption,
+  buildBrowserDomActionExpression,
+  buildBrowserExtractExpression,
+  buildBrowserScrollExpression,
+  buildBrowserSelectOptionExpression,
+  type BrowserDomActionInput,
+  type BrowserExtractInput,
+  type BrowserScrollInput,
+  type BrowserSelectOptionInput,
+} from './browser-script-policy'
+import { getSettings } from './settings-service'
+import { isValidImageBytes } from '@canopy/runtime-pi'
+import { describeBrowserRendererCrash, isBrowserRendererCrash } from './browser-crash-policy'
+import { logCrashEvent } from './crash-guard'
+
+const MAX_TRACE_ITEMS = 30
+/** 总数超限时只回收 Agent 创建且未在使用的标签，绝不自动关闭用户标签。 */
+const MAX_BROWSER_TABS = 20
+/** 最小化或不在前台展示的浏览器 session 最多保留 8 个，防止长期会话累积 WebContents。 */
+const MAX_BACKGROUND_BROWSER_SESSIONS = 8
+const MAX_SCREENSHOT_BYTES = 3 * 1024 * 1024
+const ACTION_HIGHLIGHT_DURATION_MS = 900
+const MAX_BROWSER_SCRIPT_RESULT_CHARS = 64_000
+
+type CdpResponse = Record<string, unknown>
+type RefEntry = { backendNodeId: number; generation: number; label: string; editable: boolean }
+type BrowserWaitCondition = { kind: 'url' | 'text' | 'selector'; value: string }
+type BrowserTabRecord = {
+  tabId: string
+  view: WebContentsView
+  state: BrowserTabState
+  refs: Map<string, RefEntry>
+  /** 页面文档/观察代际；导航、关闭、调试器恢复后即失效。 */
+  generation: number
+  /** 防止 UI 与 Agent 在同一 Tab 上交错下发命令。 */
+  commandTail: Promise<void>
+  isLocalPreview: boolean
+  /** 仅表示来源：由 Agent 创建的标签始终保留标识，不随当前工作标签切换而丢失。 */
+  openedByAgent: boolean
+  /** 此标签是页面 window.open / target=_blank 创建的真实 child window。 */
+  openedByPopup: boolean
+  /** popup 的 opener tab，用于父标签关闭时递归回收子窗口。 */
+  openerTabId: string | null
+  /** about:blank/blob/data 仅允许作为 popup 首次导航，不可被后续导航复用。 */
+  popupInitialUrl: string | null
+  popupInitialNavigationPending: boolean
+  /** 用于在超限时优先回收最久未使用的 Agent 标签。 */
+  lastActivityAt: number
+  /** 页面声明的 HTTP(S) favicon；仅用于 renderer 标签图标。 */
+  favicon: string | null
+  /** 当前 favicon 所属站点，用于判断同站导航是否该保留图标（见 browser-favicon-policy）。 */
+  faviconOrigin: string | null
+  highlightTimer?: ReturnType<typeof setTimeout>
+  lastBounds?: BrowserViewLayout['bounds']
+  /**
+   * 渲染进程已崩溃（OOM / crashed / killed…）：置位后所有 CDP 命令立即失败并告诉 Agent 怎么办，
+   * 而不是等 8s/30s 超时再重连调试器空转。新一轮加载（did-start-loading）即清除。
+   */
+  crashed?: { reason: string; at: number }
+  /** 仅记录当前实际挂载的 owner；隐藏时 detach，但保留 WebContents 及页面状态。 */
+  attachedOwner: BrowserWindow | null
+}
+type BrowserTabOptions = {
+  isLocalPreview?: boolean
+  claimAsAgent?: boolean
+  openedByPopup?: boolean
+  openerTabId?: string
+  popupInitialUrl?: string
+  /** Electron setWindowOpenHandler 交给 createWindow 的完整 child 构造选项，必须原样使用。 */
+  viewOptions?: Electron.WebContentsViewConstructorOptions
+}
+
+export interface BrowserUserContextSnapshot {
+  activeTabId: string
+  url: string
+  title: string
+  openedAt: number
+}
+
+type BrowserSessionRecord = {
+  sessionId: string
+  partition: string
+  browserSession: Session
+  tabs: Map<string, BrowserTabRecord>
+  /** 用户当前在面板中查看的标签。 */
+  activeTabId: string
+  /** Agent 未显式传 tabId 时继续操作的工作标签；被关闭后必须显式新建/选择。 */
+  agentTabId: string | null
+  /** 当前 Agent run 的取消源；UI 操作不接入此 signal。 */
+  agentAbortController: AbortController
+  /** 当前已入队或正在执行的 Agent 浏览器操作数量；非零时 session 不参与后台回收。 */
+  activeAgentOperationCount: number
+  /** 应用 overlay 临时遮挡 BrowserSlot 时保持回收保护。 */
+  preserveSessionOnHide: boolean
+  allowedRoots: string[]
+  executionSource: BrowserExecutionSource
+  /** 全会话的脱敏账本，避免仅显示 Agent 当前 tab 的最后 30 条。 */
+  ledger: BrowserTraceItem[]
+  /** 用户在面板中主动打开/操作过浏览器；用于下一条消息的实时上下文。 */
+  userOpenedAt: number | null
+  /** 每个 BrowserSlot 独立拒绝晚到布局；双 Pane 下不能用 Session 级 revision 互相覆盖。 */
+  lastLayoutRevisionByTab: Map<string, number>
+  /** 受控下载与 PDF 导出记录，最新在前。 */
+  downloads: BrowserDownloadItem[]
+}
+
+type BrowserSessionConfiguration = {
+  profileKey: string
+  allowedRoots: string[]
+  executionSource: BrowserExecutionSource
+}
+
+/** 一个前台 BrowserSlot 对应一个原生 WebContentsView；同一 Agent Session 最多可同时呈现多个。 */
+type BrowserPresentation = {
+  sessionId: string
+  tabId: string
+  revision: number
+}
+
+export interface ConfigureBrowserSessionInput {
+  profileKey: string
+  allowedRoots?: string[]
+  executionSource?: BrowserExecutionSource
+}
+
+export interface BrowserObservation {
+  tabId: string
+  url: string
+  title: string
+  generation: number
+  elements: Array<{ ref: string; role: string; name: string; editable: boolean }>
+}
+
+function emptyTabState(tabId: string): BrowserTabState {
+  return { tabId, url: '', title: '新建标签页', loading: false, visible: false, canGoBack: false, canGoForward: false, trace: [] }
+}
+
+function textValue(value: unknown): string {
+  if (typeof value === 'string') return value.trim()
+  if (value && typeof value === 'object' && 'value' in value && typeof value.value === 'string') return value.value.trim()
+  return ''
+}
+
+function booleanValue(value: unknown): boolean {
+  return Boolean(value && typeof value === 'object' && 'value' in value && value.value === true)
+}
+
+function axPropertyBoolean(ax: Record<string, unknown>, propertyName: string): boolean {
+  const properties = Array.isArray(ax.properties) ? ax.properties : []
+  return properties.some((property) => (
+    property
+    && typeof property === 'object'
+    && (property as Record<string, unknown>).name === propertyName
+    && booleanValue((property as Record<string, unknown>).value)
+  ))
+}
+
+/** Chromium 把 contenteditable 表示为 editable=true，也可能是 token: richtext/plaintext。 */
+function axPropertyEditable(ax: Record<string, unknown>): boolean {
+  const properties = Array.isArray(ax.properties) ? ax.properties : []
+  return properties.some((property) => {
+    if (!property || typeof property !== 'object') return false
+    const record = property as Record<string, unknown>
+    if (record.name !== 'editable' || !record.value || typeof record.value !== 'object') return false
+    const value = (record.value as Record<string, unknown>).value
+    return value === true || (typeof value === 'string' && value !== '' && value !== 'false')
+  })
+}
+
+function isEditableAxNode(ax: Record<string, unknown>): boolean {
+  const role = textValue(ax.role).toLowerCase()
+  return role === 'textbox' || role === 'searchbox' || axPropertyEditable(ax)
+}
+
+function normalizeBrowserScriptResult(value: unknown): unknown {
+  if (value === undefined) return null
+  try {
+    const serialized = JSON.stringify(value)
+    if (serialized === undefined) return null
+    if (serialized.length > MAX_BROWSER_SCRIPT_RESULT_CHARS) {
+      return {
+        truncated: true,
+        preview: serialized.slice(0, MAX_BROWSER_SCRIPT_RESULT_CHARS),
+        totalChars: serialized.length,
+      }
+    }
+    return JSON.parse(serialized) as unknown
+  } catch {
+    return String(value).slice(0, MAX_BROWSER_SCRIPT_RESULT_CHARS)
+  }
+}
+
+function describeBrowserScriptException(response: CdpResponse): string {
+  const details = response.exceptionDetails
+  if (!details || typeof details !== 'object') return '页面 JavaScript 执行失败。'
+  const record = details as Record<string, unknown>
+  return textValue(record.exception) || textValue(record.text) || '页面 JavaScript 执行失败。'
+}
+
+export class BrowserController {
+  private owner: BrowserWindow | null = null
+  private readonly sessions = new Map<string, BrowserSessionRecord>()
+  private readonly configurations = new Map<string, BrowserSessionConfiguration>()
+  /** Electron persistent partition 生命周期长于 Agent session；同一 Session 只安装一次网络 guard 与下载处理（下载事件属于 Session，不能随 Canopy 会话重复注册）。 */
+  private readonly guardedSessions = new WeakSet<Session>()
+  /** 自定义 partition 不继承 default session 的协议处理器，必须单独注册本地预览协议。 */
+  private readonly previewProtocolSessions = new WeakSet<Session>()
+  /** 同一前台 Agent Session 可同时拥有多个原生 WebContentsView（双 Pane）。 */
+  private readonly presentations = new Map<string, BrowserPresentation>()
+  /** 原生视图仍只能属于一个前台 Agent Session，防止后台 Session 穿透到当前界面。 */
+  private foregroundPresentationSessionId: string | null = null
+  /** 最近一次切换前台 Session 的 show 代际，用于拒绝晚到的旧 Session show。 */
+  private latestForegroundPresentationRevision = 0
+
+  configureSession(sessionId: string, input: ConfigureBrowserSessionInput): void {
+    const previous = this.configurations.get(sessionId)
+    const allowedRoots = input.allowedRoots ?? previous?.allowedRoots ?? []
+    const executionSource = input.executionSource ?? previous?.executionSource ?? 'user'
+    this.configurations.set(sessionId, {
+      profileKey: input.profileKey,
+      allowedRoots: [...new Set(allowedRoots.filter(Boolean))],
+      executionSource,
+    })
+    const browserSession = this.sessions.get(sessionId)
+    if (browserSession) {
+      browserSession.allowedRoots = [...new Set(allowedRoots.filter(Boolean))]
+      browserSession.executionSource = executionSource
+    }
+  }
+
+  setAllowedRoots(sessionId: string, allowedRoots: string[]): void {
+    const previous = this.configurations.get(sessionId)
+    this.configureSession(sessionId, {
+      profileKey: previous?.profileKey ?? resolveBrowserProfileKey(undefined, sessionId),
+      allowedRoots,
+      executionSource: previous?.executionSource,
+    })
+  }
+
+  setOwnerWindow(window: BrowserWindow): void {
+    this.owner = window
+  }
+
+  private emit(browserSession: BrowserSessionRecord): void {
+    if (!this.owner || this.owner.isDestroyed()) return
+    // WebContents 的关闭/导航事件可能晚于 disposeTab 到达；已移除的 session
+    // 不再发布状态，避免把正常的生命周期竞态升级为主进程未捕获异常。
+    if (this.sessions.get(browserSession.sessionId) !== browserSession) return
+    if (browserSession.tabs.size === 0 || !browserSession.tabs.has(browserSession.activeTabId)) return
+    this.owner.webContents.send(AGENT_IPC_CHANNELS.BROWSER_STATE_CHANGED, this.buildState(browserSession))
+  }
+
+  private emitClosed(sessionId: string): void {
+    if (!this.owner || this.owner.isDestroyed()) return
+    const change: BrowserSessionClosed = { sessionId, closed: true }
+    this.owner.webContents.send(AGENT_IPC_CHANNELS.BROWSER_STATE_CHANGED, change)
+  }
+
+  private emitFocusedTab(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
+    if (!this.owner || this.owner.isDestroyed() || !this.isManagedTabCurrent(browserSession, tab)) return
+    const change: BrowserTabFocusChange = { sessionId: browserSession.sessionId, tabId: tab.tabId }
+    this.owner.webContents.send(AGENT_IPC_CHANNELS.BROWSER_TAB_FOCUSED, change)
+  }
+
+  private buildState(browserSession: BrowserSessionRecord): BrowserViewState {
+    const active = browserSession.tabs.get(browserSession.activeTabId)
+    if (!active) throw new Error('受管浏览器没有有效标签。')
+    const trace = browserSession.ledger.slice(-MAX_TRACE_ITEMS)
+    return {
+      sessionId: browserSession.sessionId,
+      executionSource: browserSession.executionSource,
+      activeTabId: active.tabId,
+      agentTabId: browserSession.agentTabId,
+      tabs: [...browserSession.tabs.values()].map((tab) => ({
+        tabId: tab.tabId,
+        url: tab.state.url,
+        title: tab.state.title,
+        ...(tab.favicon ? { favicon: tab.favicon } : {}),
+        loading: tab.state.loading,
+        openedByAgent: tab.openedByAgent,
+        openedByPopup: tab.openedByPopup,
+      })),
+      url: active.state.url,
+      title: active.state.title,
+      loading: active.state.loading,
+      visible: active.state.visible,
+      canGoBack: active.state.canGoBack,
+      canGoForward: active.state.canGoForward,
+      trace,
+      activity: trace.at(-1) ?? null,
+      downloads: browserSession.downloads.slice(0, MAX_BROWSER_DOWNLOAD_RECORDS),
+    }
+  }
+
+  private getSession(sessionId: string): BrowserSessionRecord {
+    const browserSession = this.sessions.get(sessionId)
+    if (!browserSession) throw new Error('受管浏览器会话不存在。')
+    return browserSession
+  }
+
+  /**
+   * 用户打开浏览器、切换标签或从地址栏导航都视为明确的页面上下文信号。
+   * 不记录页面正文，下一条消息仅带入当前标签的标题和 URL，Agent 如有必要再主动 Observe。
+   */
+  private markUserBrowserContext(browserSession: BrowserSessionRecord): void {
+    browserSession.userOpenedAt ??= Date.now()
+    const active = browserSession.tabs.get(browserSession.activeTabId)
+    if (active) active.lastActivityAt = Date.now()
+  }
+
+  getUserContext(sessionId: string): BrowserUserContextSnapshot | null {
+    const browserSession = this.sessions.get(sessionId)
+    if (!browserSession?.userOpenedAt) return null
+    const active = browserSession.tabs.get(browserSession.activeTabId)
+    if (!active?.state.url) return null
+    return {
+      activeTabId: active.tabId,
+      url: active.state.url,
+      title: active.state.title,
+      openedAt: browserSession.userOpenedAt,
+    }
+  }
+
+  /** 用户面板的当前标签；仅 renderer 操作及原生 View layout 使用。 */
+  private getDisplayTab(browserSession: BrowserSessionRecord, tabId?: string): BrowserTabRecord {
+    const resolvedTabId = tabId ?? browserSession.activeTabId
+    const tab = browserSession.tabs.get(resolvedTabId)
+    if (!tab) throw new Error(`浏览器标签不存在: ${resolvedTabId}`)
+    return tab
+  }
+
+  /** Agent 的当前工作标签；用户在 UI 切换标签不会影响这里。 */
+  private getAgentTab(browserSession: BrowserSessionRecord, tabId?: string): BrowserTabRecord {
+    const resolvedTabId = tabId ?? browserSession.agentTabId
+    if (!resolvedTabId) throw new Error('Agent 工作标签已被关闭。请先使用 BrowserNewTab 新建工作标签，或用 BrowserSelectTab 显式选择已有标签。')
+    const tab = browserSession.tabs.get(resolvedTabId)
+    if (!tab) throw new Error(`浏览器标签不存在: ${resolvedTabId}`)
+    return tab
+  }
+
+  /**
+   * 在首次确认前，仍先创建并发布浏览器状态，以便渲染进程展示风险告知；
+   * 但不允许实际读取、导航或操作第三方网页。
+   */
+  private assertRiskDisclaimerAcknowledged(): void {
+    if (hasAcknowledgedBrowserRiskDisclaimer(getSettings())) return
+    throw new Error('首次使用受管浏览器前，请在浏览器面板阅读并确认平台账号风险告知后重试。')
+  }
+
+  private updateNavigationState(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
+    // Navigation callbacks can arrive after the tab was closed or its session removed.
+    if (this.sessions.get(browserSession.sessionId) !== browserSession) return
+    if (browserSession.tabs.get(tab.tabId) !== tab || tab.view.webContents.isDestroyed()) return
+
+    const contents = tab.view.webContents
+    try {
+      tab.state.url = contents.getURL()
+      tab.state.title = contents.getTitle() || '未命名页面'
+      tab.state.loading = contents.isLoading()
+      tab.state.canGoBack = contents.canGoBack()
+      tab.state.canGoForward = contents.canGoForward()
+    } catch {
+      // The WebContents may be destroyed between the lifecycle check and the read.
+      return
+    }
+    this.emit(browserSession)
+  }
+
+  private trace(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, action: BrowserTraceAction, summary: string, status: BrowserOperationStatus = 'verified'): void {
+    tab.lastActivityAt = Date.now()
+    let domain: string | null = null
+    try { domain = new URL(tab.state.url).host || null } catch { /* 新建标签页或本地预览 */ }
+    const item: BrowserTraceItem = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      action,
+      summary,
+      at: Date.now(),
+      success: status === 'dispatched' || status === 'verified',
+      status,
+      tabId: tab.tabId,
+      domain,
+      executionSource: browserSession.executionSource,
+    }
+    tab.state.trace = [...tab.state.trace, item].slice(-MAX_TRACE_ITEMS)
+    browserSession.ledger = [...browserSession.ledger, item].slice(-100)
+    this.emit(browserSession)
+  }
+
+  private invalidateTabDocument(tab: BrowserTabRecord): void {
+    tab.refs.clear()
+    tab.generation++
+  }
+
+  /** 将同一 tab 的 UI/Agent 指令顺序化；一个失败不会卡死后续命令。 */
+  private enqueueTab<T>(tab: BrowserTabRecord, task: () => Promise<T>): Promise<T> {
+    const next = tab.commandTail.then(task, task)
+    tab.commandTail = next.then(() => undefined, () => undefined)
+    return next
+  }
+
+  private agentSignal(browserSession: BrowserSessionRecord, signal?: AbortSignal): AbortSignal {
+    if (browserSession.agentAbortController.signal.aborted) browserSession.agentAbortController = new AbortController()
+    if (!signal) return browserSession.agentAbortController.signal
+    if (signal.aborted) return signal
+    // Native signal composition avoids retaining a per-operation closure on the session signal until Stop Agent.
+    return AbortSignal.any([signal, browserSession.agentAbortController.signal])
+  }
+
+  private runTabOperation<T>(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, signal: AbortSignal | undefined, task: (operationSignal: AbortSignal | undefined) => Promise<T>, operationLease?: () => void): Promise<T> {
+    // 只有 Agent 工具传入 signal；renderer 操作只排队，不会被 Stop Agent 取消。
+    const operationSignal = signal ? this.agentSignal(browserSession, signal) : undefined
+    const protectsFromEviction = !!signal
+    const releaseLease = operationLease ?? (protectsFromEviction ? this.acquireAgentOperation(browserSession) : undefined)
+    const operation = this.enqueueTab(tab, async () => {
+      throwIfBrowserOperationAborted(operationSignal)
+      return task(operationSignal)
+    })
+    if (!releaseLease) return operation
+    return operation.finally(releaseLease)
+  }
+
+  private acquireAgentOperation(browserSession: BrowserSessionRecord): () => void {
+    browserSession.activeAgentOperationCount += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      browserSession.activeAgentOperationCount = Math.max(0, browserSession.activeAgentOperationCount - 1)
+      this.pruneBackgroundSessions()
+    }
+  }
+
+  private assertCurrentDocument(tab: BrowserTabRecord, generation: number, signal?: AbortSignal): void {
+    throwIfBrowserOperationAborted(signal)
+    if (tab.generation !== generation || tab.view.webContents.isDestroyed()) {
+      throw new Error('页面已变化或标签已关闭，请先重新调用 BrowserObserve。')
+    }
+  }
+
+  /** Stop Agent 时调用：停止等待，并阻断尚未下发的页面命令。 */
+  cancelSession(sessionId: string): void {
+    const browserSession = this.sessions.get(sessionId)
+    if (!browserSession) return
+    browserSession.agentAbortController.abort()
+    browserSession.agentAbortController = new AbortController()
+    const agentTabId = browserSession.agentTabId
+    if (agentTabId) {
+      const tab = browserSession.tabs.get(agentTabId)
+      if (tab) {
+        this.invalidateTabDocument(tab)
+        try { tab.view.webContents.stop() } catch { /* WebContents 已销毁 */ }
+        this.trace(browserSession, tab, 'tab', 'Agent 已停止浏览器操作；已发送指令的结果未知，请重新观察页面。', 'unknown')
+      }
+    }
+  }
+
+  private installSessionGuards(browserSession: Session): void {
+    if (this.guardedSessions.has(browserSession)) return
+    this.guardedSessions.add(browserSession)
+    browserSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+    // 上游 #1768 在此处加了 setCertificateVerifyProc(callback(0))，即受管浏览器 Session 内无条件放行任何证书
+    // （自签名、过期、域名不匹配、MITM 一律通过）。我方不采：用户不在内网环境，拿不到内网自签名证书的收益，
+    // 却要付出「HTTPS 校验整体失效」的代价。若将来出现企业内网用户，应做成按主机白名单 + 用户显式确认，
+    // 而不是整个 Session 放行（长期分叉见 docs/architecture/11）。
+    browserSession.webRequest.onBeforeRequest((details, callback) => {
+      let protocol = ''
+      try { protocol = new URL(details.url).protocol } catch { callback({ cancel: true }); return }
+      if (protocol !== 'http:' && protocol !== 'https:') {
+        callback({ cancel: false })
+        return
+      }
+      void assertSafeBrowserDestination(details.url)
+        .then(() => callback({ cancel: false }))
+        .catch(() => callback({ cancel: true }))
+    })
+    browserSession.on('will-download', (_event, item, contents) => this.handleWillDownload(item, contents))
+  }
+
+  /** Electron Session 可被同 profile 的多个 Canopy 会话共享，须由触发下载的 WebContents 反查归属。 */
+  private locateTabByWebContents(contents: WebContents): { record: BrowserSessionRecord; tab: BrowserTabRecord } | null {
+    for (const record of this.sessions.values()) {
+      for (const tab of record.tabs.values()) {
+        if (tab.view.webContents.id === contents.id) return { record, tab }
+      }
+    }
+    return null
+  }
+
+  /**
+   * 受控下载：不再一律取消，改为强制落盘到数据目录内的下载目录。
+   * 文件名消毒 + 重名加序号，网页无法指定路径；超过大小上限即取消。
+   */
+  private handleWillDownload(item: Electron.DownloadItem, contents: WebContents): void {
+    const located = this.locateTabByWebContents(contents)
+    if (!located) {
+      item.cancel()
+      return
+    }
+    const { record, tab } = located
+    const stamp = Date.now()
+    if (shouldCancelDownload(0, item.getTotalBytes())) {
+      this.trace(record, tab, 'download', `已取消超过大小上限的下载：${item.getFilename()}`, 'failed')
+      item.cancel()
+      return
+    }
+    const dir = getBrowserDownloadsDir()
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch {
+      this.trace(record, tab, 'download', '下载目录创建失败，已取消下载', 'failed')
+      item.cancel()
+      return
+    }
+    const filename = resolveUniqueFilename(
+      sanitizeDownloadFilename(item.getFilename(), stamp),
+      (candidate) => existsSync(join(dir, candidate)),
+    )
+    const savePath = join(dir, filename)
+    item.setSavePath(savePath)
+    const download: BrowserDownloadItem = {
+      id: `dl-${stamp}-${Math.random().toString(36).slice(2, 8)}`,
+      filename,
+      path: savePath,
+      source: 'page',
+      state: 'in_progress',
+      receivedBytes: 0,
+      totalBytes: item.getTotalBytes(),
+      startedAt: stamp,
+      finishedAt: null,
+    }
+    record.downloads = [download, ...record.downloads].slice(0, MAX_BROWSER_DOWNLOAD_RECORDS)
+    this.trace(record, tab, 'download', `开始下载 ${filename}`, 'dispatched')
+    // 上游 0.17.26 的下载来源校验：Electron 在回调返回后立即定盘，故先同步 setSavePath，
+    // 再暂停做异步 DNS 校验，安全才放行，防内网/解析欺骗类下载源。
+    item.pause()
+    void assertSafeBrowserDownloadUrl(item.getURL())
+      .then(() => item.resume())
+      .catch(() => {
+        download.reason = '不安全或不受支持的下载来源'
+        item.cancel()
+      })
+    // updated 事件高频触发；进度广播节流，终态由 done 保证送达
+    let lastProgressEmitAt = 0
+    item.on('updated', (_updatedEvent, state) => {
+      download.receivedBytes = item.getReceivedBytes()
+      download.totalBytes = item.getTotalBytes()
+      if (shouldCancelDownload(download.receivedBytes, download.totalBytes)) {
+        download.reason = '超过单文件大小上限'
+        item.cancel()
+        return
+      }
+      if (state === 'interrupted') download.reason = '网络中断或服务器终止'
+      const now = Date.now()
+      if (now - lastProgressEmitAt >= 500) {
+        lastProgressEmitAt = now
+        this.emit(record)
+      }
+    })
+    item.once('done', (_doneEvent, state) => {
+      download.finishedAt = Date.now()
+      download.receivedBytes = item.getReceivedBytes()
+      download.totalBytes = item.getTotalBytes()
+      download.state = state === 'completed' ? 'completed' : state === 'cancelled' ? 'cancelled' : 'interrupted'
+      if (state === 'completed') {
+        this.trace(record, tab, 'download', `下载完成：${filename}`, 'verified')
+      } else {
+        this.trace(record, tab, 'download', `下载${state === 'cancelled' ? '已取消' : '中断'}：${filename}${download.reason ? `（${download.reason}）` : ''}`, 'failed')
+      }
+    })
+  }
+
+  /** 将标签当前页面导出为 PDF，落盘到受控下载目录并计入下载记录。 */
+  async exportPdf(sessionId: string, tabId?: string, useAgentTab = false): Promise<BrowserDownloadItem> {
+    this.assertRiskDisclaimerAcknowledged()
+    const browserSession = this.getSession(sessionId)
+    const tab = useAgentTab ? this.getAgentTab(browserSession, tabId) : this.getDisplayTab(browserSession, tabId)
+    if (!tab.state.url) throw new Error('当前标签没有可导出的页面。')
+    const stamp = Date.now()
+    const dir = getBrowserDownloadsDir()
+    mkdirSync(dir, { recursive: true })
+    const buffer = await tab.view.webContents.printToPDF({ printBackground: true })
+    const filename = resolveUniqueFilename(
+      buildPdfExportFilename(tab.state.title, stamp),
+      (candidate) => existsSync(join(dir, candidate)),
+    )
+    const savePath = join(dir, filename)
+    writeFileSync(savePath, buffer)
+    const download: BrowserDownloadItem = {
+      id: `pdf-${stamp}-${Math.random().toString(36).slice(2, 8)}`,
+      filename,
+      path: savePath,
+      source: 'pdf-export',
+      state: 'completed',
+      receivedBytes: buffer.length,
+      totalBytes: buffer.length,
+      startedAt: stamp,
+      finishedAt: Date.now(),
+    }
+    browserSession.downloads = [download, ...browserSession.downloads].slice(0, MAX_BROWSER_DOWNLOAD_RECORDS)
+    this.trace(browserSession, tab, 'export', `已导出 PDF：${filename}`, 'verified')
+    return structuredClone(download)
+  }
+
+  /** 本会话下载记录快照（Agent 工具查询用）。 */
+  listDownloads(sessionId: string): BrowserDownloadItem[] {
+    const browserSession = this.sessions.get(sessionId)
+    return browserSession ? structuredClone(browserSession.downloads) : []
+  }
+
+  private isManagedTabCurrent(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): boolean {
+    return this.sessions.get(browserSession.sessionId) === browserSession && browserSession.tabs.get(tab.tabId) === tab
+  }
+
+  private installPreviewProtocol(browserSession: Session): void {
+    if (this.previewProtocolSessions.has(browserSession)) return
+    browserSession.protocol.handle('canopy-file', handleAppFileRequest)
+    this.previewProtocolSessions.add(browserSession)
+  }
+
+  private createSession(sessionId: string, allowedRoots: string[] = []): BrowserSessionRecord {
+    if (!this.owner || this.owner.isDestroyed()) throw new Error('主窗口尚未就绪，无法创建内置浏览器。')
+    const configuration = this.configurations.get(sessionId)
+    const profileKey = configuration?.profileKey ?? resolveBrowserProfileKey(undefined, sessionId)
+    const partition = buildPersistentBrowserPartition(profileKey)
+    const browserSession = electronSession.fromPartition(partition)
+    // 默认 UA 会暴露 Electron；受管网页改为诚实的 Canopy 标识，并保留 Chromium token 保证站点兼容。
+    browserSession.setUserAgent(buildCanopyBrowserUserAgent(browserSession.getUserAgent(), app.getVersion()))
+    const record: BrowserSessionRecord = {
+      sessionId,
+      partition,
+      browserSession,
+      tabs: new Map(),
+      activeTabId: '',
+      agentTabId: null,
+      agentAbortController: new AbortController(),
+      activeAgentOperationCount: 0,
+      preserveSessionOnHide: false,
+      allowedRoots: [...new Set((allowedRoots.length > 0 ? allowedRoots : configuration?.allowedRoots ?? []).filter(Boolean))],
+      executionSource: configuration?.executionSource ?? 'user',
+      ledger: [],
+      userOpenedAt: null,
+      lastLayoutRevisionByTab: new Map(),
+      downloads: [],
+    }
+    this.installSessionGuards(browserSession)
+    this.installPreviewProtocol(browserSession)
+    this.sessions.set(sessionId, record)
+    return record
+  }
+
+  private createTab(browserSession: BrowserSessionRecord, isLocalPreview = false, claimAsAgent = false, popupOptions?: Pick<BrowserTabOptions, 'openedByPopup' | 'openerTabId' | 'popupInitialUrl' | 'viewOptions'>): BrowserTabRecord {
+    if (!this.owner || this.owner.isDestroyed()) throw new Error('主窗口尚未就绪，无法创建浏览器标签。')
+    const tabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const view = new WebContentsView(popupOptions?.viewOptions ?? {
+      webPreferences: {
+        partition: browserSession.partition,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+        // 受管浏览器 view 大部分时间不可见（面板未展开/切走标签/被弹层遮挡/多会话仅一个前台），
+        // 不关后台节流的话 Chromium 会把页面 setTimeout 压到 1Hz、rAF 停摆——
+        // Agent 注入的等待/轮询类脚本被放大约 20 倍，还会连锁触发 8s CDP 超时重连。
+        // 与主窗口（index.ts createWindow）同款处理。
+        backgroundThrottling: false,
+      },
+    })
+    const popupInitialUrl = popupOptions?.popupInitialUrl ?? null
+    const tab: BrowserTabRecord = {
+      tabId,
+      view,
+      state: emptyTabState(tabId),
+      refs: new Map(),
+      generation: 0,
+      commandTail: Promise.resolve(),
+      isLocalPreview,
+      openedByAgent: claimAsAgent,
+      openedByPopup: popupOptions?.openedByPopup ?? false,
+      openerTabId: popupOptions?.openerTabId ?? null,
+      popupInitialUrl,
+      popupInitialNavigationPending: popupInitialUrl !== null && isTransientBrowserPopupUrl(popupInitialUrl),
+      lastActivityAt: Date.now(),
+      favicon: null,
+      faviconOrigin: null,
+      attachedOwner: null,
+    }
+    view.setVisible(false)
+    view.webContents.setWindowOpenHandler(({ url }) => {
+      if (!isSupportedBrowserPopupUrl(url)) {
+        this.trace(browserSession, tab, 'popup', '已阻止不安全或不受支持的新窗口链接', 'failed')
+        return { action: 'deny' }
+      }
+      // createWindow 必须同步返回；同时确认 opener 仍是当前受管会话的一部分，防止关闭后遗留 view。
+      if (this.sessions.get(browserSession.sessionId) !== browserSession || !browserSession.tabs.has(tab.tabId)) return { action: 'deny' }
+      // Electron 必须在此同步 callback 中用它交给的 options 构造 child WebContents；
+      // 提前创建独立 WebContents 会触发 "Invalid webContents" 并终止应用。
+      let popup: BrowserTabRecord | null = null
+      return {
+        action: 'allow',
+        // 子窗口要能活过父标签：我方按内容类型决定去留（见 disposePopupChildren），
+        // 这里若设 false，Electron 会在底层先把子 WebContents 跟父窗口绑定销毁，
+        // 用户在必应点开的网页就会随必应标签一起消失。
+        outlivesOpener: true,
+        createWindow: (options) => {
+          popup = this.createTab(browserSession, false, false, {
+            openedByPopup: true,
+            openerTabId: tab.tabId,
+            popupInitialUrl: url,
+            // 必须原样传入 Electron 给 createWindow 的完整 options，不能只抽取 webPreferences。
+            viewOptions: options,
+          })
+          this.activateDisplayTab(browserSession, popup)
+          this.trace(browserSession, popup, 'popup', isTransientBrowserPopupUrl(url) ? '已打开临时新窗口' : '已打开新窗口', 'dispatched')
+          // popup 尚未有 BrowserSlot，显式要求 renderer 将它放入当前焦点 Pane。
+          this.emitFocusedTab(browserSession, popup)
+          return popup.view.webContents
+        },
+      }
+    })
+    view.webContents.on('will-navigate', (event, url) => {
+      // 在校验及真正导航前失效，避免 Observe 后在新页面按旧坐标操作。
+      this.invalidateTabDocument(tab)
+      try {
+        const isInitialTransientPopupNavigation = tab.popupInitialNavigationPending && tab.popupInitialUrl === url && isTransientBrowserPopupUrl(url)
+        if (isInitialTransientPopupNavigation) {
+          tab.popupInitialNavigationPending = false
+          return
+        }
+        if (isAuthorizedPreviewProtocol(url) && tab.isLocalPreview) return
+        assertSafeBrowserUrl(url)
+      } catch {
+        event.preventDefault()
+        this.trace(browserSession, tab, 'navigate', '已阻止不安全的页面跳转', 'failed')
+      }
+    })
+    view.webContents.on('focus', () => {
+      if (!this.isManagedTabCurrent(browserSession, tab) || !this.hasPresentation(browserSession.sessionId, tab.tabId)) return
+      tab.lastActivityAt = Date.now()
+      browserSession.activeTabId = tab.tabId
+      this.emit(browserSession)
+      this.emitFocusedTab(browserSession, tab)
+    })
+    view.webContents.on('did-start-loading', () => {
+      // 加载状态会因子资源再次开始，不能在此清 favicon，否则已获取的页面图标会被覆盖回默认图标。
+      this.invalidateTabDocument(tab)
+      // 崩溃后的重新加载会拉起全新的渲染进程；调试通道多半已随旧进程失效，趁此补挂。
+      if (tab.crashed) {
+        tab.crashed = undefined
+        try {
+          if (!view.webContents.debugger.isAttached()) view.webContents.debugger.attach('1.3')
+        } catch (error) {
+          console.warn('[受管浏览器] 崩溃后重新加载，CDP 重新 attach 失败:', error)
+        }
+        this.trace(browserSession, tab, 'tab', '页面已重新加载，标签恢复可用', 'verified')
+      }
+      this.updateNavigationState(browserSession, tab)
+    })
+    view.webContents.on('page-favicon-updated', (_event, faviconUrls: string[]) => {
+      // favicon URL 来自不可信页面，renderer 仅允许加载普通 HTTP(S) 图片，避免 data/blob 等任意 scheme。
+      tab.favicon = faviconUrls.find((faviconUrl) => {
+        try {
+          const protocol = new URL(faviconUrl).protocol
+          return protocol === 'https:' || protocol === 'http:'
+        } catch {
+          return false
+        }
+      }) ?? null
+      // 记录图标所属站点：同站再次导航时据此保留图标（Chromium 不会重复派发本事件）
+      tab.faviconOrigin = tab.favicon ? getFaviconOrigin(view.webContents.getURL()) : null
+      this.emit(browserSession)
+    })
+    view.webContents.on('render-process-gone', (_event, details) => {
+      if (browserSession.tabs.get(tab.tabId) !== tab) return
+      if (!isBrowserRendererCrash(details.reason)) return
+      const text = describeBrowserRendererCrash(details.reason, details.exitCode)
+      tab.crashed = { reason: details.reason, at: Date.now() }
+      // 旧文档的 ref / generation 全部作废，防止 Agent 拿着崩溃前的 ref 继续操作。
+      this.invalidateTabDocument(tab)
+      logCrashEvent('browser-render-process-gone', `session=${browserSession.sessionId} tab=${tab.tabId} url=${tab.state.url || '(空)'} reason=${details.reason} exitCode=${details.exitCode}`)
+      console.error(`[受管浏览器] 标签 ${tab.tabId} 渲染进程退出: reason=${details.reason} exitCode=${details.exitCode} url=${tab.state.url}`)
+      this.trace(browserSession, tab, 'tab', text.trace, 'failed')
+      this.updateNavigationState(browserSession, tab)
+    })
+    // 页面假死（脚本死循环等）不等于崩溃，CDP 超时路径会自行处理；这里只留证，便于事后归因。
+    view.webContents.on('unresponsive', () => {
+      logCrashEvent('browser-unresponsive', `session=${browserSession.sessionId} tab=${tab.tabId} url=${tab.state.url || '(空)'}`)
+      console.warn(`[受管浏览器] 标签 ${tab.tabId} 页面无响应: ${tab.state.url}`)
+    })
+    view.webContents.on('responsive', () => {
+      console.warn(`[受管浏览器] 标签 ${tab.tabId} 页面恢复响应`)
+    })
+    view.webContents.on('did-stop-loading', () => this.updateNavigationState(browserSession, tab))
+    view.webContents.on('page-title-updated', () => this.updateNavigationState(browserSession, tab))
+    view.webContents.on('did-navigate', (_event, navigatedUrl: string) => {
+      // 只在**站点真的换了**时清理旧图标。上游此处无条件清空，但 Chromium 只在 favicon
+      // 变化时才补发 page-favicon-updated，同站再次导航（重定向落地 / SPA 路由 / 重载）
+      // 清空后没有补发，图标就永久消失了（必应首页实测）。判定见 browser-favicon-policy。
+      if (shouldClearFaviconOnNavigate(tab.faviconOrigin, navigatedUrl)) {
+        tab.favicon = null
+        tab.faviconOrigin = null
+      }
+      tab.popupInitialNavigationPending = false
+      this.invalidateTabDocument(tab)
+      this.updateNavigationState(browserSession, tab)
+    })
+    view.webContents.on('did-navigate-in-page', () => { tab.popupInitialNavigationPending = false; this.invalidateTabDocument(tab); this.updateNavigationState(browserSession, tab) })
+    view.webContents.on('destroyed', () => {
+      if (!browserSession.tabs.has(tab.tabId)) return
+      browserSession.tabs.delete(tab.tabId)
+      browserSession.lastLayoutRevisionByTab.delete(tab.tabId)
+      this.removePresentation(browserSession.sessionId, tab.tabId)
+      this.clearAgentTargetHighlight(tab)
+      this.detachTabView(tab)
+      this.repairTabSelection(browserSession, tab.tabId)
+      if (browserSession.tabs.size === 0) {
+        this.sessions.delete(browserSession.sessionId)
+        this.clearPresentationsForSession(browserSession.sessionId)
+        if (this.foregroundPresentationSessionId === browserSession.sessionId) this.foregroundPresentationSessionId = null
+        this.emitClosed(browserSession.sessionId)
+        return
+      }
+      this.emit(browserSession)
+    })
+    try { view.webContents.debugger.attach('1.3') } catch (error) { console.warn('[受管浏览器] CDP attach 失败:', error) }
+    browserSession.tabs.set(tabId, tab)
+    if (!browserSession.activeTabId) browserSession.activeTabId = tabId
+    if (claimAsAgent) browserSession.agentTabId = tabId
+    return tab
+  }
+
+  private getOrCreateSession(sessionId: string, allowedRoots: string[] = [], createAgentTab = true): BrowserSessionRecord {
+    const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId, allowedRoots)
+    if (allowedRoots.length > 0) this.setAllowedRoots(sessionId, allowedRoots)
+    if (browserSession.tabs.size === 0) this.createTab(browserSession, false, createAgentTab)
+    // 每个 Browser* 调用都先发布可渲染状态：即使后续操作失败，当前激活会话也能立即展示浏览器。
+    this.emit(browserSession)
+    return browserSession
+  }
+
+  /**
+   * CDP 在页面进程卡死时可能永久不返回。超时后重连 debugger，避免一个 Observe
+   * 卡住整个 Agent turn，也让下一次 Browser* 调用能使用新的通道继续工作。
+   */
+  private async cdp(tab: BrowserTabRecord, method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<CdpResponse> {
+    throwIfBrowserOperationAborted(signal)
+    // 渲染进程已崩溃：立即给 Agent 一个能指导下一步的错误，绝不进入「超时 → 重连 → 再超时」的空转。
+    if (tab.crashed) throw new Error(describeBrowserRendererCrash(tab.crashed.reason).agentError)
+    const debuggerClient = tab.view.webContents.debugger
+    if (!debuggerClient.isAttached()) throw new Error('浏览器调试通道不可用。')
+    try {
+      return await withBrowserCdpTimeout(
+        () => debuggerClient.sendCommand(method, params) as Promise<CdpResponse>,
+        method,
+        timeoutMs,
+        signal,
+      )
+    } catch (error) {
+      if (error instanceof BrowserCdpTimeoutError) this.recoverDebugger(tab, method)
+      throw error
+    }
+  }
+
+  private recoverDebugger(tab: BrowserTabRecord, timedOutMethod: string): void {
+    // 重连会使所有 backend node/ref 的有效性不可判定。
+    this.invalidateTabDocument(tab)
+    const debuggerClient = tab.view.webContents.debugger
+    try {
+      if (debuggerClient.isAttached()) debuggerClient.detach()
+      debuggerClient.attach('1.3')
+      console.warn(`[受管浏览器] CDP ${timedOutMethod} 超时，已重连调试通道。`)
+    } catch (error) {
+      console.warn(`[受管浏览器] CDP ${timedOutMethod} 超时后无法重连调试通道:`, error)
+    }
+  }
+
+  /** 通过 CDP Overlay 渲染临时高亮，不向第三方页面注入脚本或修改 DOM。 */
+  private async highlightAgentTarget(tab: BrowserTabRecord, backendNodeId: number): Promise<void> {
+    // 高亮是纯装饰：view 不可见时没人看得到，跳过可省去两次 CDP 往返对串行命令队列的占用。
+    if (!tab.state.visible) return
+    if (tab.highlightTimer) clearTimeout(tab.highlightTimer)
+    try {
+      await this.cdp(tab, 'Overlay.enable')
+      await this.cdp(tab, 'Overlay.highlightNode', {
+        backendNodeId,
+        highlightConfig: {
+          showInfo: false,
+          contentColor: { r: 59, g: 130, b: 246, a: 0.16 },
+          borderColor: { r: 59, g: 130, b: 246, a: 0.95 },
+        },
+      })
+      tab.highlightTimer = setTimeout(() => {
+        tab.highlightTimer = undefined
+        void this.cdp(tab, 'Overlay.hideHighlight').catch(() => undefined)
+      }, ACTION_HIGHLIGHT_DURATION_MS)
+    } catch (error) {
+      console.warn('[受管浏览器] 无法渲染 Agent 操作高亮:', error)
+    }
+  }
+
+  private clearAgentTargetHighlight(tab: BrowserTabRecord): void {
+    if (tab.highlightTimer) clearTimeout(tab.highlightTimer)
+    tab.highlightTimer = undefined
+  }
+
+  async open(sessionId: string): Promise<BrowserViewState> {
+    // 用户从界面手动打开浏览器时，初始标签不应伪装成 Agent 标签。
+    const browserSession = this.getOrCreateSession(sessionId, [], false)
+    this.markUserBrowserContext(browserSession)
+    const activeTab = this.getDisplayTab(browserSession)
+    // 首次风险告知前不能加载第三方页面；告知已确认后才将用户空白页导航到默认首页（跟随设置里的搜索引擎，默认必应）。
+    if (hasAcknowledgedBrowserRiskDisclaimer(getSettings())
+      && browserSession.agentTabId !== activeTab.tabId
+      && !activeTab.openedByAgent
+      && (activeTab.state.url === '' || activeTab.state.url === 'about:blank')) {
+      return this.navigateDisplay(sessionId, getBrowserNewTabUrl(this.resolveSearchEngine()), activeTab.tabId)
+    }
+    this.emit(browserSession)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  getState(sessionId: string): BrowserViewState | null {
+    const browserSession = this.sessions.get(sessionId)
+    return browserSession ? structuredClone(this.buildState(browserSession)) : null
+  }
+
+  listTabs(sessionId: string): BrowserViewState {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  private presentationKey(sessionId: string, tabId: string): string {
+    return `${sessionId}\u0000${tabId}`
+  }
+
+  private hasPresentation(sessionId: string, tabId: string): boolean {
+    return this.presentations.has(this.presentationKey(sessionId, tabId))
+  }
+
+  private hasPresentationForSession(sessionId: string): boolean {
+    for (const presentation of this.presentations.values()) {
+      if (presentation.sessionId === sessionId) return true
+    }
+    return false
+  }
+
+  private removePresentation(sessionId: string, tabId: string): void {
+    this.presentations.delete(this.presentationKey(sessionId, tabId))
+  }
+
+  private clearPresentationsForSession(sessionId: string): void {
+    for (const [key, presentation] of this.presentations) {
+      if (presentation.sessionId === sessionId) this.presentations.delete(key)
+    }
+  }
+
+  /**
+   * 所有受管标签都挂在同一个 BrowserWindow.contentView。同一个前台 Agent Session
+   * 可以有多个不重叠的 Pane，但其他 Session 的原生 View 必须全部 detach。
+   */
+  private hideViewsOutsideSession(targetSessionId: string): Set<BrowserSessionRecord> {
+    const changedSessions = new Set<BrowserSessionRecord>()
+    for (const browserSession of this.sessions.values()) {
+      if (browserSession.sessionId === targetSessionId) continue
+      for (const tab of browserSession.tabs.values()) {
+        if (this.hideTabView(tab)) changedSessions.add(browserSession)
+      }
+      this.clearPresentationsForSession(browserSession.sessionId)
+    }
+    return changedSessions
+  }
+
+  private emitChangedSessions(changedSessions: Set<BrowserSessionRecord>): void {
+    for (const browserSession of changedSessions) this.emit(browserSession)
+  }
+
+  /** 隐藏时从原生 View 树移除，避免 Chromium 继续按前台 WebContentsView 调度。 */
+  private detachTabView(tab: BrowserTabRecord): void {
+    try { tab.view.setVisible(false) } catch { /* WebContents/View 已销毁 */ }
+    const attachedOwner = tab.attachedOwner
+    if (!attachedOwner) return
+    tab.attachedOwner = null
+    try {
+      if (!attachedOwner.isDestroyed()) attachedOwner.contentView.removeChildView(tab.view)
+    } catch { /* owner 或 View 已销毁/已被 Electron 移除 */ }
+  }
+
+  /** 重新展示时只恢复原生挂载、bounds 和 visible，不重建 WebContents。 */
+  private attachTabView(tab: BrowserTabRecord): boolean {
+    const owner = this.owner
+    if (!owner || owner.isDestroyed() || tab.view.webContents.isDestroyed()) {
+      this.detachTabView(tab)
+      return false
+    }
+    if (tab.attachedOwner !== owner) {
+      this.detachTabView(tab)
+      try {
+        owner.contentView.addChildView(tab.view)
+        tab.attachedOwner = owner
+      } catch {
+        return false
+      }
+    }
+    try {
+      if (tab.lastBounds) tab.view.setBounds(tab.lastBounds)
+      tab.view.setVisible(true)
+      return true
+    } catch {
+      this.detachTabView(tab)
+      return false
+    }
+  }
+
+  private hideTabView(tab: BrowserTabRecord): boolean {
+    this.detachTabView(tab)
+    if (!tab.state.visible) return false
+    tab.state.visible = false
+    return true
+  }
+
+  private isBackgroundSession(browserSession: BrowserSessionRecord): boolean {
+    if (this.hasPresentationForSession(browserSession.sessionId)) return false
+    if (browserSession.preserveSessionOnHide) return false
+    if (browserSession.activeAgentOperationCount > 0) return false
+    return [...browserSession.tabs.values()].every((tab) => !tab.state.visible)
+  }
+
+  private sessionLastActivityAt(browserSession: BrowserSessionRecord): number {
+    return Math.max(0, ...[...browserSession.tabs.values()].map((tab) => tab.lastActivityAt))
+  }
+
+  /** 回收最久未使用的后台浏览器，永不关闭当前前台或已有 Agent 操作的 session。 */
+  private pruneBackgroundSessions(): void {
+    const candidates = [...this.sessions.values()]
+      .filter((browserSession) => this.isBackgroundSession(browserSession))
+      .sort((left, right) => this.sessionLastActivityAt(left) - this.sessionLastActivityAt(right))
+    const excess = candidates.length - MAX_BACKGROUND_BROWSER_SESSIONS
+    for (const browserSession of candidates.slice(0, Math.max(0, excess))) {
+      void this.close(browserSession.sessionId).catch((error) => {
+        console.warn('[受管浏览器] 回收后台浏览器失败:', error)
+      })
+    }
+  }
+
+  /** 用户最小化当前浏览器：保留 WebContents，并隐藏该 Session 的所有可见 Pane。 */
+  minimize(sessionId: string): void {
+    const browserSession = this.getSession(sessionId)
+    const activeTab = this.getDisplayTab(browserSession)
+    activeTab.lastActivityAt = Date.now()
+    const changedSessions = new Set<BrowserSessionRecord>()
+    for (const tab of browserSession.tabs.values()) {
+      if (this.hideTabView(tab)) changedSessions.add(browserSession)
+    }
+    this.clearPresentationsForSession(browserSession.sessionId)
+    if (this.foregroundPresentationSessionId === browserSession.sessionId) this.foregroundPresentationSessionId = null
+    browserSession.preserveSessionOnHide = false
+    this.emitChangedSessions(changedSessions)
+    this.pruneBackgroundSessions()
+  }
+
+  setLayout(layout: BrowserViewLayout): void {
+    const browserSession = this.sessions.get(layout.sessionId)
+    if (!browserSession) return
+    const tabId = layout.tabId ?? browserSession.activeTabId
+    const tab = browserSession.tabs.get(tabId)
+    // BrowserSlot 卸载与 tab 关闭可交错，晚到布局不应让 renderer 报错。
+    if (!tab) return
+    // 双 Pane 中两个 Slot 会交错发布。每个 tab 只和自己的最新 revision 比较，
+    // 不能让右 Pane 的 resize 吞掉左 Pane 尚未到达的 show。
+    const previousRevision = browserSession.lastLayoutRevisionByTab.get(tab.tabId) ?? 0
+    if (!isNewBrowserTabLayoutRevision(layout.revision, previousRevision)) return
+    browserSession.lastLayoutRevisionByTab.set(tab.tabId, layout.revision)
+    browserSession.preserveSessionOnHide = layout.preserveSessionOnHide === true
+
+    const bounds = layout.bounds
+    const visible = layout.visible && bounds.width > 4 && bounds.height > 4 && !!this.owner && !this.owner.isDestroyed() && this.owner.isVisible()
+    if (!visible) {
+      const changedSessions = new Set<BrowserSessionRecord>()
+      if (this.hideTabView(tab)) changedSessions.add(browserSession)
+      this.removePresentation(browserSession.sessionId, tab.tabId)
+      this.emitChangedSessions(changedSessions)
+      return
+    }
+
+    // revision 在 renderer 全局单调递增。只有切换 Agent Session 时才用全局 show
+    // 代际仲裁；同一 Session 的多个 Pane 必须独立接受各自的新布局。
+    if (!canBrowserSessionTakeForeground({
+      incomingSessionId: browserSession.sessionId,
+      foregroundSessionId: this.foregroundPresentationSessionId,
+      revision: layout.revision,
+      latestForegroundRevision: this.latestForegroundPresentationRevision,
+    })) return
+
+    const changedSessions = this.foregroundPresentationSessionId === browserSession.sessionId
+      ? new Set<BrowserSessionRecord>()
+      : this.hideViewsOutsideSession(browserSession.sessionId)
+    this.foregroundPresentationSessionId = browserSession.sessionId
+    this.latestForegroundPresentationRevision = Math.max(this.latestForegroundPresentationRevision, layout.revision)
+
+    const zoomFactor = this.owner?.webContents.getZoomFactor() ?? 1
+    const adjustedBounds = {
+      x: Math.round(bounds.x * zoomFactor),
+      y: Math.round(bounds.y * zoomFactor),
+      width: Math.round(bounds.width * zoomFactor),
+      height: Math.round(bounds.height * zoomFactor),
+    }
+    if (!tab.lastBounds || Object.entries(adjustedBounds).some(([key, value]) => tab.lastBounds?.[key as keyof typeof adjustedBounds] !== value)) {
+      tab.lastBounds = { ...adjustedBounds }
+    }
+    const shown = this.attachTabView(tab)
+    if (tab.state.visible !== shown) {
+      tab.state.visible = shown
+      changedSessions.add(browserSession)
+    }
+    if (shown) {
+      this.presentations.set(this.presentationKey(browserSession.sessionId, tab.tabId), {
+        sessionId: browserSession.sessionId,
+        tabId: tab.tabId,
+        revision: layout.revision,
+      })
+    } else {
+      this.removePresentation(browserSession.sessionId, tab.tabId)
+    }
+    this.emitChangedSessions(changedSessions)
+    if (shown) this.pruneBackgroundSessions()
+  }
+
+  /**
+   * Tab 激活只改变地址栏/历史操作的逻辑目标。原生 View 的增删和 bounds 由各自
+   * BrowserSlot 的 setLayout 驱动，因此聚焦一个 Browser Pane 不能隐藏另一个 Pane。
+   */
+  private activateDisplayTab(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
+    tab.lastActivityAt = Date.now()
+    browserSession.activeTabId = tab.tabId
+    const isPresented = this.foregroundPresentationSessionId === browserSession.sessionId
+      && this.hasPresentation(browserSession.sessionId, tab.tabId)
+    const visible = isPresented && this.attachTabView(tab)
+    if (!visible) {
+      this.detachTabView(tab)
+      this.removePresentation(browserSession.sessionId, tab.tabId)
+    }
+    if (tab.state.visible !== visible) tab.state.visible = visible
+    this.emit(browserSession)
+  }
+
+  /**
+   * 父标签关闭时处理它的子标签（页面 window.open / target=_blank 打开的）。
+   *
+   * 我方对上游的分叉：上游无条件递归回收，导致「必应里点开一个网页，关掉必应标签后
+   * 那个网页也没了」（维护者实测报障）。浏览器里 A 打开的 B 是独立标签，关 A 不动 B。
+   * 现在只回收停在 about:blank / blob: / data: 的临时弹窗（登录、支付框那类），
+   * 已落到真实网页的子标签保留并解除父子关系。判定见 browser-popup-lifecycle。
+   */
+  private disposePopupChildren(browserSession: BrowserSessionRecord, openerTabId: string): void {
+    const children = [...browserSession.tabs.values()].filter((child) => child.openerTabId === openerTabId)
+    if (children.length === 0) return
+
+    const disposeIds = new Set(getPopupChildrenToDispose(children.map((child) => ({
+      tabId: child.tabId,
+      currentUrl: child.state.url,
+      initialUrl: child.popupInitialUrl,
+      initialNavigationPending: child.popupInitialNavigationPending,
+    }))))
+
+    for (const child of children) {
+      if (disposeIds.has(child.tabId)) {
+        this.disposeTab(browserSession, child)
+        continue
+      }
+      // 留下的子标签就此独立：断开 opener，避免将来被别的关闭链再次牵连
+      child.openerTabId = null
+      child.openedByPopup = false
+    }
+  }
+
+  private repairTabSelection(browserSession: BrowserSessionRecord, removedTabId: string): void {
+    if (browserSession.activeTabId === removedTabId || !browserSession.tabs.has(browserSession.activeTabId)) {
+      browserSession.activeTabId = browserSession.tabs.keys().next().value as string
+    }
+    if (browserSession.agentTabId === removedTabId || (browserSession.agentTabId !== null && !browserSession.tabs.has(browserSession.agentTabId))) {
+      browserSession.agentTabId = null
+    }
+  }
+
+  private disposeTab(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
+    if (!browserSession.tabs.has(tab.tabId)) return
+    // Child windows use Electron's opener lifetime and must not outlive a tab closed from Canopy UI either.
+    this.disposePopupChildren(browserSession, tab.tabId)
+    browserSession.tabs.delete(tab.tabId)
+    browserSession.lastLayoutRevisionByTab.delete(tab.tabId)
+    this.removePresentation(browserSession.sessionId, tab.tabId)
+    this.clearAgentTargetHighlight(tab)
+    try { if (tab.view.webContents.debugger.isAttached()) tab.view.webContents.debugger.detach() } catch { /* 已销毁 */ }
+    this.detachTabView(tab)
+    if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close()
+  }
+
+  /**
+   * 达到上限时回收最久未使用的 Agent 标签。用户创建的标签、当前前台标签和 Agent 当前工作标签
+   * 一律保留；若没有安全候选，宁可暂时超过限制也不擅自关闭用户内容。
+   */
+  private reclaimExcessAgentTabs(browserSession: BrowserSessionRecord): number {
+    const candidates = [...browserSession.tabs.values()]
+      .filter((tab) => tab.openedByAgent && tab.tabId !== browserSession.activeTabId && tab.tabId !== browserSession.agentTabId)
+      .sort((left, right) => left.lastActivityAt - right.lastActivityAt)
+    let reclaimed = 0
+    while (browserSession.tabs.size > MAX_BROWSER_TABS && candidates.length > 0) {
+      const tab = candidates.shift()
+      if (!tab || !browserSession.tabs.has(tab.tabId)) continue
+      this.disposeTab(browserSession, tab)
+      reclaimed += 1
+    }
+    return reclaimed
+  }
+
+  /** Agent 新建工作 tab，并立即切到该标签让用户能看到接下来的操作。 */
+  async createNewTab(sessionId: string, url?: string): Promise<BrowserViewState> {
+    // 新会话由本方法直接创建 Agent 标签，不能经 getOrCreateSession 预建空白标签，
+    // 否则携带 URL 时会留下一个无用的初始标签。
+    this.assertRiskDisclaimerAcknowledged()
+    const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId)
+    const tab = this.createTab(browserSession, false, true)
+    browserSession.agentTabId = tab.tabId
+    this.activateDisplayTab(browserSession, tab)
+    const reclaimed = this.reclaimExcessAgentTabs(browserSession)
+    this.trace(browserSession, tab, 'tab', reclaimed > 0
+      ? `Agent 新建并打开工作标签；已回收 ${reclaimed} 个最久未使用的 Agent 标签`
+      : `Agent 新建并打开工作标签 ${tab.tabId}`)
+    if (url?.trim()) return this.navigate(sessionId, url, tab.tabId)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  /** 用户在浏览器面板中新建 tab；不会抢占 Agent 的工作 tab。 */
+  async createDisplayTab(sessionId: string, url?: string): Promise<BrowserViewState> {
+    // 首次由历史链接携带 URL 创建时，此标签本身就是初始展示标签；不要先经
+    // getOrCreateSession 预建一个空白标签，否则会留下无用的空 Tab。
+    const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    this.markUserBrowserContext(browserSession)
+    const tab = this.createTab(browserSession)
+    this.activateDisplayTab(browserSession, tab)
+    const reclaimed = this.reclaimExcessAgentTabs(browserSession)
+    if (reclaimed > 0) this.trace(browserSession, tab, 'tab', `标签超过 ${MAX_BROWSER_TABS} 个上限，已回收 ${reclaimed} 个最久未使用的 Agent 标签`)
+    if (url?.trim()) return this.navigateDisplay(sessionId, url)
+    return this.navigateDisplay(sessionId, getBrowserNewTabUrl(this.resolveSearchEngine()), tab.tabId)
+  }
+
+  /** 用户 UI 的 tab 选择只控制显示，不影响 Agent 之后的默认操作目标。 */
+  selectTab(sessionId: string, tabId: string): BrowserViewState {
+    const browserSession = this.getSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    this.markUserBrowserContext(browserSession)
+    const tab = this.getDisplayTab(browserSession, tabId)
+    this.activateDisplayTab(browserSession, tab)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  /** Agent 显式切换工作 tab，并同步激活用户可见的前台标签。 */
+  selectAgentTab(sessionId: string, tabId: string): BrowserViewState {
+    const browserSession = this.getSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    browserSession.agentTabId = tab.tabId
+    this.activateDisplayTab(browserSession, tab)
+    this.trace(browserSession, tab, 'tab', `Agent 切换并打开工作标签 ${tab.tabId}`)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  async closeTab(sessionId: string, tabId: string): Promise<BrowserViewState | null> {
+    const browserSession = this.getSession(sessionId)
+    const tab = this.getDisplayTab(browserSession, tabId)
+    this.disposeTab(browserSession, tab)
+    if (browserSession.tabs.size === 0) {
+      this.sessions.delete(sessionId)
+      this.clearPresentationsForSession(sessionId)
+      if (this.foregroundPresentationSessionId === sessionId) this.foregroundPresentationSessionId = null
+      this.emitClosed(sessionId)
+      return null
+    }
+    this.repairTabSelection(browserSession, tab.tabId)
+    this.emit(browserSession)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  async previewOpen(sessionId: string, inputPath: string, tabId: string | undefined, allowedRoots: string[], baseDir?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId, allowedRoots)
+    const releaseAgentOperation = this.acquireAgentOperation(browserSession)
+    try {
+      this.assertRiskDisclaimerAcknowledged()
+      // 先校验路径，避免无效路径遗留一个空白的 Agent 预览标签。
+      const preview = createAuthorizedPreviewUrl(inputPath, browserSession.allowedRoots, baseDir)
+      const tab = tabId ? this.getAgentTab(browserSession, tabId) : this.createTab(browserSession, true, true)
+      browserSession.agentTabId = tab.tabId
+      this.activateDisplayTab(browserSession, tab)
+      const reclaimed = this.reclaimExcessAgentTabs(browserSession)
+      if (reclaimed > 0) this.trace(browserSession, tab, 'tab', `已回收 ${reclaimed} 个最久未使用的 Agent 标签以保持最多 ${MAX_BROWSER_TABS} 个标签`)
+      return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+        tab.isLocalPreview = true
+        try {
+          await this.loadUrl(tab, preview.url, operationSignal)
+          this.trace(browserSession, tab, 'navigate', `预览本地文件 ${preview.filePath.split(/[\\/]/).pop() ?? preview.filePath}`, 'verified')
+          this.updateNavigationState(browserSession, tab)
+          return structuredClone(this.buildState(browserSession))
+        } catch (error) {
+          this.trace(browserSession, tab, 'navigate', error instanceof BrowserOperationAbortedError ? '本地预览已停止，结果未知' : '本地预览加载失败', error instanceof BrowserOperationAbortedError ? 'unknown' : 'failed')
+          throw error
+        }
+      }, releaseAgentOperation)
+    } catch (error) {
+      releaseAgentOperation()
+      throw error
+    }
+  }
+
+  /**
+   * 当前生效的搜索引擎：每次导航实时从设置读取并同步给 browser-policy，
+   * 这样设置页改完立即生效，不需要额外的变更推送通道。
+   */
+  private resolveSearchEngine(): BrowserSearchEngineId {
+    return setBrowserSearchEngine(getSettings().browserSearchEngine)
+  }
+
+  private async loadUrl(tab: BrowserTabRecord, url: string, signal?: AbortSignal): Promise<void> {
+    throwIfBrowserOperationAborted(signal)
+    await loadUrlToleratingSlowFinish(tab.view.webContents, url, BROWSER_OBSERVE_TIMEOUT_MS + 3_000, signal)
+  }
+
+  async navigate(sessionId: string, url: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId, [])
+    const releaseAgentOperation = this.acquireAgentOperation(browserSession)
+    try {
+      this.assertRiskDisclaimerAcknowledged()
+      const tab = this.getAgentTab(browserSession, tabId)
+      const safeUrl = await assertSafeBrowserDestination(url, this.resolveSearchEngine())
+      const host = new URL(safeUrl).host
+      return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+        tab.isLocalPreview = false
+        this.trace(browserSession, tab, 'navigate', `正在打开 ${host}`, 'dispatched')
+        try {
+          await this.loadUrl(tab, safeUrl, operationSignal)
+          this.trace(browserSession, tab, 'navigate', `已打开 ${host}`, 'verified')
+          this.updateNavigationState(browserSession, tab)
+          return structuredClone(this.buildState(browserSession))
+        } catch (error) {
+          this.trace(browserSession, tab, 'navigate', error instanceof BrowserOperationAbortedError ? `打开 ${host} 已停止，结果未知` : `无法打开 ${host}`, error instanceof BrowserOperationAbortedError ? 'unknown' : 'failed')
+          throw error
+        }
+      }, releaseAgentOperation)
+    } catch (error) {
+      releaseAgentOperation()
+      throw error
+    }
+  }
+
+  /** 用户地址栏导航当前显示 tab，不会改变 Agent 的工作 tab。 */
+  async navigateDisplay(sessionId: string, url: string, tabId?: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId, [])
+    this.assertRiskDisclaimerAcknowledged()
+    this.markUserBrowserContext(browserSession)
+    const tab = this.getDisplayTab(browserSession, tabId)
+    const safeUrl = await assertSafeBrowserDestination(url, this.resolveSearchEngine())
+    const host = new URL(safeUrl).host
+    return this.runTabOperation(browserSession, tab, undefined, async () => {
+      tab.isLocalPreview = false
+      this.trace(browserSession, tab, 'navigate', `正在打开 ${host}`, 'dispatched')
+      try {
+        await this.loadUrl(tab, safeUrl)
+        this.trace(browserSession, tab, 'navigate', `已打开 ${host}`, 'verified')
+        this.updateNavigationState(browserSession, tab)
+        return structuredClone(this.buildState(browserSession))
+      } catch (error) {
+        this.trace(browserSession, tab, 'navigate', `无法打开 ${host}`, 'failed')
+        throw error
+      }
+    })
+  }
+
+  async goBack(sessionId: string, tabId?: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    if (tab.view.webContents.canGoBack()) tab.view.webContents.goBack()
+    this.updateNavigationState(browserSession, tab)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  async goBackDisplay(sessionId: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    return this.goBack(sessionId, this.getDisplayTab(browserSession).tabId)
+  }
+
+  async goForward(sessionId: string, tabId?: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    if (tab.view.webContents.canGoForward()) tab.view.webContents.goForward()
+    this.updateNavigationState(browserSession, tab)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  async goForwardDisplay(sessionId: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    return this.goForward(sessionId, this.getDisplayTab(browserSession).tabId)
+  }
+
+  async reload(sessionId: string, tabId?: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    tab.view.webContents.reload()
+    this.updateNavigationState(browserSession, tab)
+    return structuredClone(this.buildState(browserSession))
+  }
+
+  async reloadDisplay(sessionId: string): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    return this.reload(sessionId, this.getDisplayTab(browserSession).tabId)
+  }
+
+  async observe(sessionId: string, tabId?: string, requestedMaxElements?: number, signal?: AbortSignal): Promise<BrowserObservation> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, (operationSignal) => this.observeInternal(browserSession, tab, requestedMaxElements, operationSignal))
+  }
+
+  private async observeInternal(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, requestedMaxElements?: number, signal?: AbortSignal): Promise<BrowserObservation> {
+    try {
+      throwIfBrowserOperationAborted(signal)
+      const maxElements = resolveBrowserObserveMaxElements(requestedMaxElements)
+      // 全量 AX tree 在富文本编辑器、长列表和复杂 SPA 中会非常大；限制深度以保留主页面交互层，
+      // 同时避免 Chromium 为整棵树做序列化而长时间阻塞。
+      const observeDepth = resolveBrowserObserveAxDepth(maxElements)
+      const response = await this.cdp(tab, 'Accessibility.getFullAXTree', { depth: observeDepth }, BROWSER_OBSERVE_TIMEOUT_MS, signal)
+      throwIfBrowserOperationAborted(signal)
+      const nodes = Array.isArray(response.nodes) ? response.nodes : []
+      const candidates: Array<{ backendNodeId: number; role: string; name: string; editable: boolean }> = []
+      for (const node of nodes) {
+        if (!node || typeof node !== 'object') continue
+        const ax = node as Record<string, unknown>
+        const backendNodeId = typeof ax.backendDOMNodeId === 'number' ? ax.backendDOMNodeId : 0
+        const role = textValue(ax.role)
+        const name = textValue(ax.name)
+        const editable = isEditableAxNode(ax)
+        if (!backendNodeId || !role || (!name && !editable && !['button', 'textbox', 'link', 'checkbox', 'combobox'].includes(role))) continue
+        candidates.push({ backendNodeId, role, name: name.slice(0, browserObservationNameLimit(role)), editable })
+      }
+
+      const selected = prioritizeBrowserObservationCandidates(candidates, maxElements)
+      tab.generation++
+      tab.refs.clear()
+      const elements: BrowserObservation['elements'] = []
+      for (const candidate of selected) {
+        const ref = `r${tab.generation}-${elements.length + 1}`
+        tab.refs.set(ref, {
+          backendNodeId: candidate.backendNodeId,
+          generation: tab.generation,
+          label: candidate.name ? `${candidate.role}「${candidate.name.slice(0, 80)}」` : candidate.role,
+          editable: candidate.editable,
+        })
+        elements.push({ ref, role: candidate.role, name: candidate.name, editable: candidate.editable })
+      }
+      this.updateNavigationState(browserSession, tab)
+      this.trace(browserSession, tab, 'observe', `读取到 ${elements.length}/${maxElements} 个元素（可交互优先，AX 深度 ${observeDepth}）`)
+      return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, generation: tab.generation, elements }
+    } catch (error) {
+      this.trace(browserSession, tab, 'observe', error instanceof BrowserCdpTimeoutError ? '页面观察超时，可重试或重新加载页面' : error instanceof BrowserOperationAbortedError ? '页面观察已停止' : '页面观察失败', error instanceof BrowserOperationAbortedError ? 'unknown' : 'failed')
+      throw error
+    }
+  }
+
+  /** Find fresh semantic refs without returning a full accessibility snapshot to the model. */
+  async find(sessionId: string, query: { role?: string; name?: string; exact?: boolean; maxResults?: number }, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; generation: number; elements: BrowserObservation['elements'] }> {
+    const role = query.role?.trim().toLowerCase()
+    const name = query.name?.trim().toLowerCase()
+    const maxResults = query.maxResults ?? 20
+    if (!role && !name) throw new Error('语义定位至少需要 role 或 name。')
+    if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) throw new Error('maxResults 必须是 1 到 50 的整数。')
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      // Filter the AX tree before applying the observation ranking/cap so Find can discover a matching
+      // element that was absent from the compact BrowserObserve output.
+      const response = await this.cdp(tab, 'Accessibility.getFullAXTree', { depth: resolveBrowserObserveAxDepth(400) }, BROWSER_OBSERVE_TIMEOUT_MS, operationSignal)
+      throwIfBrowserOperationAborted(operationSignal)
+      const nodes = Array.isArray(response.nodes) ? response.nodes : []
+      const candidates: Array<{ backendNodeId: number; role: string; name: string; editable: boolean }> = []
+      for (const node of nodes) {
+        if (!node || typeof node !== 'object') continue
+        const ax = node as Record<string, unknown>
+        const backendNodeId = typeof ax.backendDOMNodeId === 'number' ? ax.backendDOMNodeId : 0
+        const candidateRole = textValue(ax.role)
+        const candidateName = textValue(ax.name)
+        const editable = isEditableAxNode(ax)
+        if (!backendNodeId || !candidateRole || (!candidateName && !editable && !['button', 'textbox', 'link', 'checkbox', 'combobox'].includes(candidateRole))) continue
+        const roleMatches = !role || candidateRole.toLowerCase() === role
+        const normalizedName = candidateName.toLowerCase()
+        const nameMatches = !name || (query.exact ? normalizedName === name : normalizedName.includes(name))
+        if (!roleMatches || !nameMatches) continue
+        candidates.push({ backendNodeId, role: candidateRole, name: candidateName.slice(0, browserObservationNameLimit(candidateRole)), editable })
+        if (candidates.length >= maxResults) break
+      }
+      tab.generation++
+      tab.refs.clear()
+      const elements: BrowserObservation['elements'] = []
+      for (const candidate of candidates) {
+        const ref = `r${tab.generation}-${elements.length + 1}`
+        tab.refs.set(ref, {
+          backendNodeId: candidate.backendNodeId,
+          generation: tab.generation,
+          label: candidate.name ? `${candidate.role}「${candidate.name.slice(0, 80)}」` : candidate.role,
+          editable: candidate.editable,
+        })
+        elements.push({ ref, role: candidate.role, name: candidate.name, editable: candidate.editable })
+      }
+      this.updateNavigationState(browserSession, tab)
+      this.trace(browserSession, tab, 'find', `语义定位到 ${elements.length} 个元素（AX 深度 ${resolveBrowserObserveAxDepth(400)}）`, 'verified')
+      return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, generation: tab.generation, elements }
+    })
+  }
+
+  private resolveRef(tab: BrowserTabRecord, ref: string): RefEntry {
+    const entry = tab.refs.get(ref)
+    if (!entry || entry.generation !== tab.generation) throw new Error('元素引用已失效，请先重新调用 browser_observe。')
+    return entry
+  }
+
+  private async centerForRef(tab: BrowserTabRecord, ref: string, signal?: AbortSignal, generation = tab.generation): Promise<{ x: number; y: number }> {
+    this.assertCurrentDocument(tab, generation, signal)
+    const { backendNodeId } = this.resolveRef(tab, ref)
+    // AX ref 可能来自懒加载列表的视口外节点。滚动后重新读取 box，不能复用旧坐标。
+    await this.cdp(tab, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }, undefined, signal)
+    this.assertCurrentDocument(tab, generation, signal)
+    const box = await this.cdp(tab, 'DOM.getBoxModel', { backendNodeId }, undefined, signal)
+    this.assertCurrentDocument(tab, generation, signal)
+    const model = box.model as Record<string, unknown> | undefined
+    const quad = Array.isArray(model?.content) ? model.content : []
+    if (quad.length < 8 || !quad.every((value) => typeof value === 'number')) throw new Error('目标元素当前不可点击，请重新观察页面。')
+    return { x: ((quad[0] as number) + (quad[2] as number) + (quad[4] as number) + (quad[6] as number)) / 4, y: ((quad[1] as number) + (quad[3] as number) + (quad[5] as number) + (quad[7] as number)) / 4 }
+  }
+
+  private async clickRef(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, ref: string, signal?: AbortSignal): Promise<RefEntry> {
+    const generation = tab.generation
+    const target = this.resolveRef(tab, ref)
+    const { x, y } = await this.centerForRef(tab, ref, signal, generation)
+    this.assertCurrentDocument(tab, generation, signal)
+    await this.highlightAgentTarget(tab, target.backendNodeId)
+    this.assertCurrentDocument(tab, generation, signal)
+    await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, undefined, signal)
+    this.assertCurrentDocument(tab, generation, signal)
+    await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, undefined, signal)
+    this.trace(browserSession, tab, 'click', `点击 ${target.label}`, 'dispatched')
+    return target
+  }
+
+  async click(sessionId: string, ref: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      await this.clickRef(browserSession, tab, ref, operationSignal)
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  async hover(sessionId: string, ref: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const generation = tab.generation
+      const target = this.resolveRef(tab, ref)
+      const { x, y } = await this.centerForRef(tab, ref, operationSignal, generation)
+      await this.highlightAgentTarget(tab, target.backendNodeId)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, undefined, operationSignal)
+      this.trace(browserSession, tab, 'hover', `悬停 ${target.label}`, 'dispatched')
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  /** Native pointer drag. It intentionally does not synthesize page JavaScript DragEvent/DataTransfer objects. */
+  async drag(sessionId: string, sourceRef: string, targetRef: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    if (!sourceRef || !targetRef) throw new Error('拖拽需要源元素和目标元素。')
+    if (sourceRef === targetRef) throw new Error('拖拽源元素和目标元素不能相同。')
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const generation = tab.generation
+      const source = this.resolveRef(tab, sourceRef)
+      const target = this.resolveRef(tab, targetRef)
+      const start = await this.centerForRef(tab, sourceRef, operationSignal, generation)
+      await this.highlightAgentTarget(tab, source.backendNodeId)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: start.x, y: start.y, button: 'left', clickCount: 1 }, undefined, operationSignal)
+      try {
+        const end = await this.centerForRef(tab, targetRef, operationSignal, generation)
+        this.assertCurrentDocument(tab, generation, operationSignal)
+        await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: end.x, y: end.y, button: 'left', buttons: 1 }, undefined, operationSignal)
+        await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: end.x, y: end.y, button: 'left', clickCount: 1 }, undefined, operationSignal)
+      } catch (error) {
+        // Best effort release avoids a stuck pointer when a page navigation invalidates the drag midway.
+        try { await this.cdp(tab, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: start.x, y: start.y, button: 'left', clickCount: 1 }) } catch { /* 页面已关闭 */ }
+        throw error
+      }
+      this.trace(browserSession, tab, 'drag', `从 ${source.label} 拖拽到 ${target.label}`, 'dispatched')
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  private async assertEditableFocus(tab: BrowserTabRecord, target: RefEntry, signal?: AbortSignal): Promise<void> {
+    const response = await this.cdp(tab, 'Accessibility.getPartialAXTree', {
+      backendNodeId: target.backendNodeId,
+      fetchRelatives: false,
+    }, undefined, signal)
+    const nodes = Array.isArray(response.nodes) ? response.nodes : []
+    const current = nodes.find((node) => (
+      node
+      && typeof node === 'object'
+      && (node as Record<string, unknown>).backendDOMNodeId === target.backendNodeId
+    )) as Record<string, unknown> | undefined
+    if (!current || !isEditableAxNode(current)) throw new Error('目标字段已不可编辑，请重新观察页面后重试。')
+    if (!axPropertyBoolean(current, 'focused')) throw new Error('无法聚焦目标字段，请重新观察页面后重试。')
+  }
+
+  async fill(sessionId: string, ref: string, text: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    if (text.length > 10_000) throw new Error('单次输入不能超过 10000 个字符。')
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const generation = tab.generation
+      const target = this.resolveRef(tab, ref)
+      if (!target.editable) throw new Error('目标元素不是可编辑字段，请重新观察后选择 input、textarea 或 contenteditable。')
+      await this.highlightAgentTarget(tab, target.backendNodeId)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: target.backendNodeId }, undefined, operationSignal)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'DOM.focus', { backendNodeId: target.backendNodeId }, undefined, operationSignal)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.assertEditableFocus(tab, target, operationSignal)
+      const selectAllModifier = process.platform === 'darwin' ? 4 : 2
+      await this.cdp(tab, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: selectAllModifier }, undefined, operationSignal)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: selectAllModifier }, undefined, operationSignal)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'Input.insertText', { text }, undefined, operationSignal)
+      this.trace(browserSession, tab, 'fill', `在 ${target.label} 输入 ${Array.from(text).length} 个字符（已脱敏）`, 'dispatched')
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  async press(sessionId: string, key: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const action = parseBrowserPressAction(key)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      if (action.kind === 'key') {
+        // rawKeyDown 与 windowsVirtualKeyCode 让 Chromium 识别非字符导航键并触发
+        // 默认行为（PageDown 滚动、Enter 提交、Tab 移动焦点），只传 key 不会滚动。
+        const keyEvent = { key: action.key, code: action.code, windowsVirtualKeyCode: action.windowsVirtualKeyCode }
+        await this.cdp(tab, 'Input.dispatchKeyEvent', { type: 'rawKeyDown', ...keyEvent }, undefined, operationSignal)
+        await this.cdp(tab, 'Input.dispatchKeyEvent', { type: 'keyUp', ...keyEvent }, undefined, operationSignal)
+        this.trace(browserSession, tab, 'press', `按下 ${action.key}`, 'dispatched')
+      } else {
+        await this.cdp(tab, 'Input.insertText', { text: action.text }, undefined, operationSignal)
+        this.trace(browserSession, tab, 'press', `输入 ${Array.from(action.text).length} 个字符（已脱敏）`, 'dispatched')
+      }
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  private async executePageExpression(tab: BrowserTabRecord, expression: string, signal?: AbortSignal, timeoutMs?: number): Promise<unknown> {
+    const response = await this.cdp(tab, 'Runtime.evaluate', {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+    }, timeoutMs, signal)
+    if (response.exceptionDetails) throw new Error(describeBrowserScriptException(response))
+    const result = response.result
+    if (!result || typeof result !== 'object') return null
+    const remote = result as Record<string, unknown>
+    if ('value' in remote) return normalizeBrowserScriptResult(remote.value)
+    return {
+      type: textValue(remote.type) || 'unknown',
+      description: textValue(remote.description) || null,
+    }
+  }
+
+  private assertWaitCondition(condition: BrowserWaitCondition, timeoutMs: number): void {
+    if (!condition.value.trim()) throw new Error('等待条件不能为空。')
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 250 || timeoutMs > 30_000) throw new Error('等待超时必须在 250 到 30000 毫秒之间。')
+  }
+
+  private async waitForInternal(browserSession: BrowserSessionRecord, tab: BrowserTabRecord, condition: BrowserWaitCondition, timeoutMs: number, operationSignal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; matched: boolean }> {
+    const startedAt = Date.now()
+    const payload = JSON.stringify(condition).replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')
+    const expression = `(() => { const condition = ${payload}; try { if (condition.kind === 'url') return location.href.includes(condition.value); if (condition.kind === 'text') return (document.body?.innerText || '').includes(condition.value); return !!document.querySelector(condition.value); } catch { return false; } })()`
+    while (Date.now() - startedAt <= timeoutMs) {
+      throwIfBrowserOperationAborted(operationSignal)
+      const result = await this.executePageExpression(tab, expression, operationSignal)
+      if (result === true) {
+        this.trace(browserSession, tab, 'wait', `已满足${condition.kind}等待条件`, 'verified')
+        return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, matched: true }
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          operationSignal?.removeEventListener('abort', abort)
+          resolve()
+        }, 250)
+        const abort = () => { clearTimeout(timer); reject(new BrowserOperationAbortedError()) }
+        operationSignal?.addEventListener('abort', abort, { once: true })
+      })
+    }
+    this.trace(browserSession, tab, 'wait', `等待${condition.kind}条件超时`, 'failed')
+    return { tabId: tab.tabId, url: tab.state.url, title: tab.state.title, matched: false }
+  }
+
+  async waitFor(sessionId: string, condition: BrowserWaitCondition, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; matched: boolean }> {
+    this.assertWaitCondition(condition, timeoutMs)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, (operationSignal) => this.waitForInternal(browserSession, tab, condition, timeoutMs, operationSignal))
+  }
+
+  /** Perform a click and an optional bounded wait as one serialized, auditable browser operation. */
+  async act(sessionId: string, ref: string, waitFor: BrowserWaitCondition | undefined, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ state: BrowserViewState; wait: { tabId: string; url: string; title: string; matched: boolean } | null }> {
+    if (waitFor) this.assertWaitCondition(waitFor, timeoutMs)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      await this.clickRef(browserSession, tab, ref, operationSignal)
+      const wait = waitFor ? await this.waitForInternal(browserSession, tab, waitFor, timeoutMs, operationSignal) : null
+      this.trace(browserSession, tab, 'act', wait ? `点击后等待${waitFor?.kind}条件` : '点击操作', wait?.matched === false ? 'failed' : 'verified')
+      return { state: structuredClone(this.buildState(browserSession)), wait }
+    })
+  }
+
+  /**
+   * 执行固定的 selector DOM 操作，优先用于 AX 无法稳定定位的富文本编辑器。
+   * 表达式由主进程生成，selector/text 均按数据而非代码传入。
+   */
+  async domAction(sessionId: string, input: BrowserDomActionInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserDomActionExpression(input), operationSignal, BROWSER_EVALUATE_TIMEOUT_MS)
+      this.trace(browserSession, tab, 'dom', `DOM ${input.action}：${input.selector.slice(0, 100)}`, 'dispatched')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async scroll(sessionId: string, input: BrowserScrollInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserScroll(input)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserScrollExpression(input), operationSignal)
+      this.trace(browserSession, tab, 'scroll', input.selector ? `滚动容器 ${input.selector.slice(0, 100)}` : '滚动页面', 'dispatched')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async extract(sessionId: string, input: BrowserExtractInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserExtract(input)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserExtractExpression(input), operationSignal)
+      this.trace(browserSession, tab, 'extract', input.selector ? `抽取区域 ${input.selector.slice(0, 100)}` : '抽取页面正文', 'verified')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async selectOption(sessionId: string, input: BrowserSelectOptionInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserSelectOption(input)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, buildBrowserSelectOptionExpression(input), operationSignal)
+      this.trace(browserSession, tab, 'select', `选择原生下拉选项 ${input.selector.slice(0, 100)}`, 'dispatched')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  private async assertUploadPaths(browserSession: BrowserSessionRecord, filePaths: string[]): Promise<string[]> {
+    if (filePaths.length < 1 || filePaths.length > 20) throw new Error('一次上传文件数量必须为 1 到 20。')
+    if (browserSession.allowedRoots.length === 0) throw new Error('当前会话没有获授权的文件目录，不能选择上传文件。')
+    const roots = await Promise.all(browserSession.allowedRoots.map(async (root) => realpath(root).catch(() => null)))
+    const authorizedRoots = roots.filter((root): root is string => !!root)
+    if (authorizedRoots.length === 0) throw new Error('当前会话的获授权目录不可访问，不能选择上传文件。')
+    return Promise.all(filePaths.map(async (filePath) => {
+      if (!path.isAbsolute(filePath)) throw new Error('上传文件必须使用绝对路径。')
+      const resolved = await realpath(filePath).catch(() => { throw new Error('上传文件不存在或不可访问。') })
+      const details = await stat(resolved).catch(() => { throw new Error('无法读取上传文件。') })
+      if (!details.isFile()) throw new Error('上传目标必须是普通文件。')
+      const authorized = authorizedRoots.some((root) => {
+        const relative = path.relative(root, resolved)
+        return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+      })
+      if (!authorized) throw new Error('上传文件不在当前会话获授权的目录内。')
+      return resolved
+    }))
+  }
+
+  async upload(sessionId: string, ref: string, filePaths: string[], tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const generation = tab.generation
+      const target = this.resolveRef(tab, ref)
+      const files = await this.assertUploadPaths(browserSession, filePaths)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      const response = await this.cdp(tab, 'DOM.describeNode', { backendNodeId: target.backendNodeId, depth: 0 }, undefined, operationSignal)
+      const node = response.node as Record<string, unknown> | undefined
+      const nodeName = typeof node?.nodeName === 'string' ? node.nodeName.toLowerCase() : ''
+      const attributes = Array.isArray(node?.attributes) ? node.attributes : []
+      const typeIndex = attributes.findIndex((value) => value === 'type')
+      const inputType = typeIndex >= 0 && typeof attributes[typeIndex + 1] === 'string' ? String(attributes[typeIndex + 1]).toLowerCase() : ''
+      if (nodeName !== 'input' || inputType !== 'file') throw new Error('目标不是 file input，请先重新观察页面并选择文件上传控件。')
+      await this.highlightAgentTarget(tab, target.backendNodeId)
+      this.assertCurrentDocument(tab, generation, operationSignal)
+      await this.cdp(tab, 'DOM.setFileInputFiles', { files, backendNodeId: target.backendNodeId }, undefined, operationSignal)
+      this.trace(browserSession, tab, 'upload', `已选择 ${files.length} 个上传文件（文件名已脱敏）`, 'dispatched')
+      return structuredClone(this.buildState(browserSession))
+    })
+  }
+
+  /**
+   * 在当前页面上下文执行用户目标所需的 JavaScript。页面与结果仍停留在受管 WebContents/CDP 通道，
+   * 不暴露 Electron/Node 能力；页面文本不可据此改变用户目标或诱导执行无关脚本。
+   */
+  async evaluate(sessionId: string, script: string, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
+    assertBrowserScript(script)
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      const result = await this.executePageExpression(tab, script, operationSignal, BROWSER_EVALUATE_TIMEOUT_MS)
+      this.trace(browserSession, tab, 'script', `执行页面 JavaScript（${script.length} 字符）`, 'dispatched')
+      return { tabId: tab.tabId, url: tab.state.url, result }
+    })
+  }
+
+  async screenshot(sessionId: string, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; mimeType: string; base64: string }> {
+    const browserSession = this.getOrCreateSession(sessionId)
+    this.assertRiskDisclaimerAcknowledged()
+    const tab = this.getAgentTab(browserSession, tabId)
+    return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
+      throwIfBrowserOperationAborted(operationSignal)
+      const image = await withBrowserCdpTimeout(() => tab.view.webContents.capturePage(), 'Page.captureScreenshot', BROWSER_OBSERVE_TIMEOUT_MS + 3_000, operationSignal)
+      throwIfBrowserOperationAborted(operationSignal)
+      if (image.isEmpty()) {
+        this.trace(browserSession, tab, 'screenshot', '截图为空，已拒绝返回无效图片', 'failed')
+        throw new Error('截图为空：浏览器页面尚未完成可捕获布局，请稍后重试或改用 BrowserObserve。')
+      }
+      const { width, height } = image.getSize()
+      if (width <= 0 || height <= 0) {
+        this.trace(browserSession, tab, 'screenshot', '截图尺寸无效，已拒绝返回无效图片', 'failed')
+        throw new Error('截图尺寸无效：浏览器页面尚未完成可捕获布局，请稍后重试或改用 BrowserObserve。')
+      }
+      const buffer = image.toPNG()
+      if (!isValidImageBytes('image/png', buffer)) {
+        this.trace(browserSession, tab, 'screenshot', '截图 PNG 数据无效，已拒绝返回无效图片', 'failed')
+        throw new Error('截图 PNG 数据无效，请稍后重试或改用 BrowserObserve。')
+      }
+      if (buffer.byteLength > MAX_SCREENSHOT_BYTES) throw new Error('截图过大，请缩小页面或改用 browser_observe。')
+      this.trace(browserSession, tab, 'screenshot', '截取当前页面', 'verified')
+      return { tabId: tab.tabId, url: tab.state.url, mimeType: 'image/png', base64: buffer.toString('base64') }
+    })
+  }
+
+  async close(sessionId: string): Promise<void> {
+    const browserSession = this.sessions.get(sessionId)
+    if (!browserSession) {
+      this.emitClosed(sessionId)
+      return
+    }
+    this.sessions.delete(sessionId)
+    this.clearPresentationsForSession(sessionId)
+    if (this.foregroundPresentationSessionId === sessionId) this.foregroundPresentationSessionId = null
+    for (const tab of browserSession.tabs.values()) {
+      this.clearAgentTargetHighlight(tab)
+      try { if (tab.view.webContents.debugger.isAttached()) tab.view.webContents.debugger.detach() } catch { /* 已销毁 */ }
+      this.detachTabView(tab)
+      if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close()
+    }
+    browserSession.tabs.clear()
+    this.emitClosed(sessionId)
+  }
+
+  dispose(): void {
+    for (const sessionId of [...this.sessions.keys()]) void this.close(sessionId)
+    this.configurations.clear()
+    this.presentations.clear()
+    this.foregroundPresentationSessionId = null
+    this.latestForegroundPresentationRevision = 0
+    this.owner = null
+  }
+}
+
+export const browserController = new BrowserController()

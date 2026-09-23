@@ -1,0 +1,566 @@
+/**
+ * 渠道（Channel）相关类型定义
+ *
+ * 渠道是用户配置的 AI 供应商连接，包含 API Key、模型列表等信息。
+ * API Key 使用 Electron safeStorage 加密后存储在本地配置文件中。
+ */
+
+
+/**
+ * 支持的 AI 供应商类型
+ */
+export type ProviderType =
+  | 'anthropic'
+  | 'anthropic-compatible'
+  | 'openai'
+  | 'openai-responses'
+  | 'deepseek'
+  | 'google'
+  | 'kimi-api'
+  | 'kimi-coding'
+  | 'opencode-go-openai'
+  | 'zhipu'
+  | 'zhipu-coding'
+  | 'zhipu-coding-team'
+  | 'ark-coding-plan'
+  | 'minimax'
+  | 'doubao'
+  | 'qwen'
+  | 'qwen-anthropic'
+  | 'qwen-token-plan'
+  | 'xiaomi'
+  | 'xiaomi-token-plan'
+  | 'openai-codex'
+  | 'xai'
+  /**
+   * OpenAI Chat Completions 的自定义请求地址。
+   *
+   * Chat 会原样请求 `baseUrl`；`openai` 则将其视为协议根地址并自动补
+   * `/chat/completions`。这保留了接入自定义网关的能力。
+   */
+  | 'custom'
+
+
+/**
+ * 返回该供应商锁死的 Base URL；非锁死供应商返回 null。
+ *
+ * 锁死供应商的地址由产品统一托管，UI 与存储层共用此真源做强制覆写。
+ */
+export function getLockedChannelBaseUrl(provider: ProviderType): string | null {
+  return null
+}
+
+/**
+ * 各供应商的默认 Base URL
+ */
+export const PROVIDER_DEFAULT_URLS: Record<ProviderType, string> = {
+  anthropic: 'https://api.anthropic.com',
+  'anthropic-compatible': '',
+  openai: 'https://api.openai.com/v1',
+  'openai-responses': 'https://api.openai.com/v1',
+  deepseek: 'https://api.deepseek.com/anthropic',
+  google: 'https://generativelanguage.googleapis.com',
+  'kimi-api': 'https://api.moonshot.cn/anthropic',
+  'kimi-coding': 'https://api.kimi.com/coding/v1',
+  'opencode-go-openai': 'https://opencode.ai/zen/go/v1',
+  zhipu: 'https://open.bigmodel.cn/api/paas/v4',
+  'zhipu-coding': 'https://open.bigmodel.cn/api/anthropic',
+  'zhipu-coding-team': 'https://open.bigmodel.cn/api/anthropic',
+  // 火山方舟 Coding Plan 专用地址（Anthropic 协议）。普通方舟 API 的 /api/v3 不消耗
+  // Coding Plan 套餐额度且会额外计费；曾用旧地址 /api/plan 由 channel-manager 读取时迁移。
+  'ark-coding-plan': 'https://ark.cn-beijing.volces.com/api/coding',
+  minimax: 'https://api.minimaxi.com/anthropic',
+  doubao: 'https://ark.cn-beijing.volces.com/api/v3',
+  qwen: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  'qwen-anthropic': 'https://dashscope.aliyuncs.com/apps/anthropic',
+  // Token Plan Anthropic endpoint is provided as a complete messages URL.
+  'qwen-token-plan': 'https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1/messages',
+  xiaomi: 'https://api.xiaomimimo.com/anthropic',
+  'xiaomi-token-plan': 'https://token-plan-cn.xiaomimimo.com/anthropic',
+  // 订阅登录渠道的 baseUrl 由 Pi SDK 内部管理，无需用户填写。
+  'openai-codex': '',
+  xai: '',
+  custom: '',
+}
+
+/**
+ * 供应商显示名称
+ */
+export const PROVIDER_LABELS: Record<ProviderType, string> = {
+  anthropic: 'Anthropic',
+  'anthropic-compatible': 'Anthropic 兼容格式',
+  openai: 'OpenAI',
+  'openai-responses': 'OpenAI Responses 格式',
+  deepseek: 'DeepSeek',
+  google: 'Google',
+  'kimi-api': 'Kimi API',
+  'kimi-coding': 'Kimi Coding Plan',
+  'opencode-go-openai': 'OpenCode Go (OpenAI 协议)',
+  zhipu: '智谱 AI',
+  'zhipu-coding': '智谱 Coding Plan',
+  'zhipu-coding-team': '智谱 Coding Plan 团队版',
+  // 上游 #1735 曾把本条改名「火山方舟 Agent Plan」并把 doubao 标成「Coding Plan」——与官方文档相悖
+  // （/api/coding 才是 Coding Plan 地址，/api/v3 按量计费），标签/URL 语义不采。
+  'ark-coding-plan': '火山方舟 Coding Plan',
+  minimax: 'MiniMax (API&编程包)',
+  // doubao 是 /api/v3 按量计费（豆包），不是 Coding Plan——上游 #1735 的改名与拆出 doubao-api 均不采。
+  doubao: '豆包',
+  // 上游 #1766：DashScope 的 Anthropic 兼容端点拉不到模型列表，OpenAI 兼容端点才是主推，主次对调。
+  qwen: '通义千问',
+  'qwen-anthropic': '通义千问 (Anthropic 协议·旧版)',
+  'qwen-token-plan': '通义千问 Token Plan',
+  xiaomi: '小米 MiMo (API)',
+  'xiaomi-token-plan': '小米 MiMo Token Plan',
+  'openai-codex': 'ChatGPT 订阅 (Codex)',
+  xai: 'xAI 订阅 (Grok)',
+  custom: 'OpenAI Chat Completions（自定义地址）',
+}
+
+/**
+ * 支持 Claude Agent Core 的供应商类型
+ *
+ * Claude Agent SDK 通过 Anthropic 兼容协议调用 `/v1/messages` 端点，
+ * 因此所有 Anthropic 协议兼容的供应商都可以用于 Agent。
+ */
+
+
+export interface ZhipuTeamCredentials {
+  apiKey: string
+  organization?: string
+  project?: string
+}
+
+function normalizeZhipuCredentialKey(key: string): string {
+  return key.trim().toLowerCase().replace(/[_-]/g, '')
+}
+
+export function parseZhipuTeamCredentials(secret: string): ZhipuTeamCredentials | null {
+  const trimmed = secret.trim()
+  if (!trimmed) return null
+
+  const pick = (record: Record<string, unknown>): ZhipuTeamCredentials | null => {
+    const normalized = new Map<string, string>()
+    for (const [key, value] of Object.entries(record)) {
+      if (typeof value === 'string' && value.trim()) {
+        normalized.set(normalizeZhipuCredentialKey(key), value.trim())
+      }
+    }
+    const apiKey = normalized.get('apikey')
+      ?? normalized.get('apitoken')
+      ?? normalized.get('token')
+      ?? normalized.get('authorization')
+      ?? normalized.get('auth')
+      ?? normalized.get('bearer')
+    const organization = normalized.get('bigmodelorganization') ?? normalized.get('organization') ?? normalized.get('org')
+    const project = normalized.get('bigmodelproject') ?? normalized.get('project')
+    if (!apiKey) return null
+    return { apiKey, organization, project }
+  }
+
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return pick(parsed as Record<string, unknown>)
+      }
+    } catch {
+      return null
+    }
+  }
+
+  const entries: Record<string, string> = {}
+  for (const part of trimmed.split(/[;\n]+/)) {
+    const index = part.indexOf('=')
+    if (index <= 0) continue
+    entries[part.slice(0, index).trim()] = part.slice(index + 1).trim()
+  }
+  return pick(entries)
+}
+
+export function extractZhipuCodingTeamApiToken(secret: string): string {
+  const credentials = parseZhipuTeamCredentials(secret)
+  if (credentials) return credentials.apiKey
+  const trimmed = secret.trim()
+  return trimmed || secret
+}
+
+/**
+ * ChatGPT (OpenAI Codex) OAuth 凭据。
+ *
+ * 复用 Channel.apiKey 字段承载：序列化为 JSON 后经 safeStorage 加密存储，
+ * 与 zhipu-coding-team 的结构化 secret 同一套「凭据塞进 apiKey 字段」模式，
+ * 避免为 OAuth 单独扩展存储 schema。字段命名对齐 Pi SDK 的 OAuthCredentials
+ * （access/refresh/expires），expires 为 Unix 毫秒时间戳。
+ */
+export interface CodexOAuthCredentials {
+  /** access token（作为 bearer token 传给 Pi SDK provider） */
+  access: string
+  /** refresh token（过期时用于换取新 token） */
+  refresh: string
+  /** access token 过期时间戳（Unix 毫秒） */
+  expires: number
+  /** 可选：从 id_token 解析出的账号标识，用于展示登录身份 */
+  accountId?: string
+}
+
+/** 将 OAuth 凭据序列化为存入 apiKey 字段的 JSON 字符串。 */
+export function serializeCodexCredentials(credentials: CodexOAuthCredentials): string {
+  return JSON.stringify(credentials)
+}
+
+/** 从 apiKey 字段解析 OAuth 凭据；非合法 JSON 或缺少必需字段时返回 null。 */
+export function parseCodexCredentials(secret: string): CodexOAuthCredentials | null {
+  const trimmed = secret.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = JSON.parse(trimmed) as Partial<CodexOAuthCredentials>
+    if (typeof parsed.access === 'string' && parsed.access
+      && typeof parsed.refresh === 'string' && parsed.refresh
+      && typeof parsed.expires === 'number') {
+      return {
+        access: parsed.access,
+        refresh: parsed.refresh,
+        expires: parsed.expires,
+        ...(typeof parsed.accountId === 'string' && parsed.accountId ? { accountId: parsed.accountId } : {}),
+      }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+/**
+ * 判断 OAuth 凭据是否已过期或即将过期。
+ *
+ * 默认预留 60s 时钟偏移余量，确保 access token 在真正过期前就触发刷新，
+ * 避免边界请求打出去才发现过期。
+ */
+export function isCodexCredentialExpired(credentials: CodexOAuthCredentials, skewMs = 60_000): boolean {
+  return Date.now() >= credentials.expires - skewMs
+}
+
+/**
+ * xAI（Grok/X 订阅）OAuth 凭据。
+ *
+ * 与 Codex 一样序列化后放入 Channel.apiKey，并由 Electron safeStorage 加密。
+ * Pi 的内置 xAI provider 使用 access / refresh / expires 来自动续期。
+ */
+export interface XaiOAuthCredentials {
+  access: string
+  refresh: string
+  expires: number
+}
+
+export function serializeXaiCredentials(credentials: XaiOAuthCredentials): string {
+  return JSON.stringify(credentials)
+}
+
+export function parseXaiCredentials(secret: string): XaiOAuthCredentials | null {
+  const trimmed = secret.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = JSON.parse(trimmed) as Partial<XaiOAuthCredentials>
+    if (typeof parsed.access === 'string' && parsed.access
+      && typeof parsed.refresh === 'string' && parsed.refresh
+      && typeof parsed.expires === 'number') {
+      return { access: parsed.access, refresh: parsed.refresh, expires: parsed.expires }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+export function isXaiCredentialExpired(credentials: XaiOAuthCredentials, skewMs = 60_000): boolean {
+  return Date.now() >= credentials.expires - skewMs
+}
+
+/**
+ * 渠道中的模型配置
+ */
+export interface ChannelModel {
+  /** 模型唯一标识（如 claude-sonnet-4-5-20250929） */
+  id: string
+  /** 模型显示名称 */
+  name: string
+  /** 是否启用 */
+  enabled: boolean
+  /** 来源标记：手动添加的模型在拉取供应商列表时保留，不会被覆盖清除 */
+  source?: 'manual' | 'fetched'
+}
+
+/**
+ * 火山方舟 Coding Plan（我方 provider `ark-coding-plan`，即 `/api/coding`）当前支持的模型名。
+ *
+ * Coding Plan 的 `/models` 返回的是方舟通用模型目录，不等于订阅套餐的授权清单，
+ * 因此不能直接把该接口返回值作为渠道模型列表（上游 #1767）。
+ *
+ * ⚠️ 上游把这份清单挂在它的 `doubao` 上（上游 doubao = Coding Plan）；我方 `doubao` 是 `/api/v3`
+ * 按量计费，通用目录对它才是正确来源，所以本清单在我方只用于 `ark-coding-plan`。
+ */
+export const VOLCENGINE_CODING_PLAN_MODELS: readonly ChannelModel[] = [
+  { id: 'doubao-seed-2.1-turbo', name: 'Doubao Seed 2.1 Turbo', enabled: true },
+  { id: 'doubao-seed-2.0-lite', name: 'Doubao Seed 2.0 Lite', enabled: true },
+  { id: 'minimax-m3', name: 'MiniMax M3', enabled: true },
+  { id: 'glm-5.3', name: 'GLM-5.3', enabled: true },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', enabled: true },
+  { id: 'deepseek-flash', name: 'DeepSeek Flash', enabled: true },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
+  { id: 'kimi-k2.7-code', name: 'Kimi K2.7 Code', enabled: true },
+]
+
+/**
+ * 渠道配置
+ *
+ * 存储在 ~/.canopy/channels.json 中，apiKey 字段为加密后的 base64 字符串
+ */
+export interface Channel {
+  /** 渠道唯一标识 */
+  id: string
+  /** 渠道名称（用户自定义） */
+  name: string
+  /** AI 供应商类型 */
+  provider: ProviderType
+  /** API Base URL */
+  baseUrl: string
+  /** 加密后的 API Key（base64 编码） */
+  apiKey: string
+  /** 可用模型列表 */
+  models: ChannelModel[]
+  /** 是否启用 */
+  enabled: boolean
+  /** 创建时间戳 */
+  createdAt: number
+  /** 更新时间戳 */
+  updatedAt: number
+}
+
+/**
+ * 创建渠道时的输入数据（apiKey 为明文）
+ */
+export interface ChannelCreateInput {
+  name: string
+  provider: ProviderType
+  baseUrl: string
+  /** 明文 API Key，主进程会加密后存储 */
+  apiKey: string
+  models: ChannelModel[]
+  enabled: boolean
+}
+
+/**
+ * 更新渠道时的输入数据（所有字段可选）
+ */
+export interface ChannelUpdateInput {
+  name?: string
+  provider?: ProviderType
+  baseUrl?: string
+  /** 明文 API Key，为空字符串表示不更新 */
+  apiKey?: string
+  models?: ChannelModel[]
+  enabled?: boolean
+}
+
+/**
+ * 渠道配置文件格式
+ */
+export interface ChannelsConfig {
+  /** 配置版本号 */
+  version: number
+  /** 已应用的一次性预设模型更新 ID，避免重复补回用户已删除的候选模型 */
+  appliedPresetModelUpdates?: string[]
+  /** 渠道列表 */
+  channels: Channel[]
+}
+
+/**
+ * 连接测试失败的归一化分类
+ *
+ * 以 HTTP 状态码为主轴判定；UI 可据此渲染不同提示 / 图标，
+ * 而无需解析 message 字符串。
+ */
+export type ChannelTestErrorType =
+  | 'auth'
+  | 'permission'
+  | 'not_found'
+  | 'rate_limit'
+  | 'quota'
+  | 'bad_request'
+  | 'server'
+  | 'network'
+  | 'timeout'
+  | 'unknown'
+
+/**
+ * 连接测试结果
+ */
+export interface ChannelTestResult {
+  /** 是否成功 */
+  success: boolean
+  /** 结果消息（含分类提示与脱敏后的供应商摘要） */
+  message: string
+  /** 归一化错误分类，成功时为空 */
+  errorType?: ChannelTestErrorType
+  /** HTTP 状态码，网络 / 超时等无响应异常时为空 */
+  statusCode?: number
+  /** 供应商原始错误摘要，已脱敏并截断 */
+  detail?: string
+}
+
+/**
+ * 拉取模型的输入参数（无需已保存的渠道，直接传入凭证）
+ */
+export interface FetchModelsInput {
+  provider: ProviderType
+  baseUrl: string
+  /** 明文 API Key */
+  apiKey: string
+}
+
+/**
+ * 直接测试渠道连接的输入参数（无需已保存的渠道，直接传入凭证）
+ */
+export interface ChannelDirectTestInput {
+  provider: ProviderType
+  baseUrl: string
+  /** 明文 API Key */
+  apiKey: string
+  /** 用于 messages 端点测试的模型 ID；不需要模型的供应商可忽略 */
+  modelId?: string
+}
+
+/**
+ * 拉取模型的结果
+ */
+export interface FetchModelsResult {
+  /** 是否成功 */
+  success: boolean
+  /** 结果消息 */
+  message: string
+  /** 获取到的模型列表 */
+  models: ChannelModel[]
+}
+
+/**
+ * 订阅 Plan 的窗口型额度。
+ *
+ * 用于展示类似「每 5 小时」和「每周」这类限频窗口的剩余比例。
+ */
+export interface ChannelPlanQuotaWindow {
+  /** 窗口类型标识 */
+  type: '5h' | 'weekly' | 'custom'
+  /** 展示标签 */
+  label: string
+  /** 剩余额度百分比，0-100 */
+  remainingPercent: number
+  /** 已使用百分比，0-100 */
+  usedPercent: number
+  /** 覆盖展示值。用于余额等无法自然转成百分比的额度。 */
+  remainingLabel?: string
+  /** 是否展示进度条。默认展示。 */
+  showProgress?: boolean
+  /** 重置时间戳（毫秒） */
+  resetAt?: number
+}
+
+/**
+ * 渠道订阅 Plan 额度查询结果。
+ */
+export interface ChannelPlanQuotaResult {
+  /** 当前渠道是否支持订阅额度查询 */
+  supported: boolean
+  /** 渠道供应商类型 */
+  provider: ProviderType
+  /** Plan 展示名称 */
+  planName?: string
+  /** 查询到的窗口额度列表 */
+  windows: ChannelPlanQuotaWindow[]
+  /** 查询时间戳（毫秒） */
+  updatedAt: number
+  /** 不支持或查询失败时的用户可读原因 */
+  message?: string
+}
+
+/**
+ * 渠道相关 IPC 通道常量
+ */
+export const CHANNEL_IPC_CHANNELS = {
+  /** 获取所有渠道列表 */
+  LIST: 'channel:list',
+  /** 创建渠道 */
+  CREATE: 'channel:create',
+  /** 更新渠道 */
+  UPDATE: 'channel:update',
+  /** 删除渠道 */
+  DELETE: 'channel:delete',
+  /** 解密获取明文 API Key */
+  DECRYPT_KEY: 'channel:decrypt-key',
+  /** 测试渠道连接 */
+  TEST: 'channel:test',
+  /** 从供应商拉取可用模型列表 */
+  FETCH_MODELS: 'channel:fetch-models',
+  /** 直接测试连接（无需已保存渠道，传入明文凭证） */
+  TEST_DIRECT: 'channel:test-direct',
+  /** 查询订阅 Plan 额度 */
+  GET_PLAN_QUOTA: 'channel:get-plan-quota',
+  /** 发起 ChatGPT (Codex) OAuth 登录，返回加密凭据与账号信息 */
+  CODEX_OAUTH_LOGIN: 'channel:codex-oauth-login',
+  /** 取消进行中的 ChatGPT OAuth 登录流程 */
+  CODEX_OAUTH_CANCEL: 'channel:codex-oauth-cancel',
+  /** Codex device-code 已就绪（主进程推送给发起登录的渲染窗口） */
+  CODEX_OAUTH_DEVICE_CODE: 'channel:codex-oauth-device-code',
+  /** 发起 xAI（Grok/X 订阅）OAuth 登录 */
+  XAI_OAUTH_LOGIN: 'channel:xai-oauth-login',
+  /** 取消进行中的 xAI OAuth 登录流程 */
+  XAI_OAUTH_CANCEL: 'channel:xai-oauth-cancel',
+  /** xAI device-code 已就绪（主进程推送给发起登录的渲染窗口） */
+  XAI_OAUTH_DEVICE_CODE: 'channel:xai-oauth-device-code',
+} as const
+
+/**
+ * ChatGPT (Codex) OAuth 登录结果。
+ *
+ * 登录在主进程执行（Pi SDK 的 codex 流程用 Node crypto + 本地回调服务），
+ * 成功后返回已加密的凭据 JSON（可直接作为 Channel.apiKey 存储）与展示信息。
+ */
+export type CodexOAuthLoginMethod = 'browser' | 'device_code'
+
+/** Pi Codex device-code 登录流程的用户可见信息。 */
+export interface CodexOAuthDeviceCode {
+  userCode: string
+  verificationUri: string
+  /** 可扫码交给另一台可联网设备完成授权。 */
+  qrCodeData?: string
+}
+
+export interface CodexOAuthLoginResult {
+  /** 是否登录成功 */
+  success: boolean
+  /**
+   * 序列化后的凭据 JSON（明文）。与现有 apiKey 明文回传模式一致：
+   * 渲染层拿到后作为 Channel.apiKey 传给 create/update，由 channel-manager 加密存储。
+   */
+  credentials?: string
+  /** 登录账号标识，用于 UI 展示 */
+  accountId?: string
+  /** 失败或取消时的用户可读原因 */
+  message?: string
+}
+
+/** xAI（Grok/X 订阅）OAuth 登录结果。 */
+export interface XaiOAuthLoginResult {
+  success: boolean
+  /** 序列化后的 OAuth 凭据 JSON；由 channel-manager 加密写入 Channel.apiKey。 */
+  credentials?: string
+  /** 失败或取消时的用户可读原因 */
+  message?: string
+}
+
+/** Pi xAI device-code 登录流程的用户可见信息。 */
+export interface XaiOAuthDeviceCode {
+  userCode: string
+  verificationUri: string
+  /** 可扫码交给另一台可联网设备完成授权。 */
+  qrCodeData?: string
+}

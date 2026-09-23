@@ -1,0 +1,288 @@
+import { describe, expect, test } from 'bun:test'
+import { DOMParser } from '@xmldom/xmldom'
+import {
+  hasRichClipboardMarkup,
+  htmlToClipboardText,
+  htmlToMarkdown,
+  looksLikeMarkdownText,
+  markdownToHtml,
+} from './markdown-rich-text'
+
+function withHtmlDocument<T>(run: () => T): T {
+  const originalDocument = globalThis.document
+  const originalNode = globalThis.Node
+  const parser = new DOMParser()
+
+  Object.assign(globalThis, {
+    document: {
+      createElement: () => {
+        let root: Element | null = null
+        return {
+          nodeType: 1,
+          tagName: 'DIV',
+          getAttribute: () => null,
+          set innerHTML(html: string) {
+            root = parser.parseFromString(`<div>${html}</div>`, 'text/html').documentElement
+          },
+          get childNodes() {
+            return root?.childNodes ?? []
+          },
+        }
+      },
+    },
+    Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
+  })
+
+  try {
+    return run()
+  } finally {
+    Object.assign(globalThis, { document: originalDocument, Node: originalNode })
+  }
+}
+
+describe('Markdown 剪贴板检测', () => {
+  test('识别常见 Markdown 文本并拒绝普通段落误判', () => {
+    expect(looksLikeMarkdownText('**粗体** 和 *斜体*\n\n---\n\n- 列表项')).toBe(true)
+    expect(looksLikeMarkdownText('这是一段没有格式标记的普通文本。')).toBe(false)
+  })
+
+  test('只把带语义标签的 HTML 当作已格式化剪贴板内容', () => {
+    expect(hasRichClipboardMarkup('<div><p>**粗体**</p></div>')).toBe(false)
+    expect(hasRichClipboardMarkup('<div><p><strong>粗体</strong></p></div>')).toBe(true)
+  })
+})
+
+describe('markdownToHtml rich preview blocks', () => {
+  test('renders leading yaml frontmatter as a collapsible metadata block', () => {
+    const html = markdownToHtml([
+      '---',
+      'title: ChatGPT Pro 20x 官方订阅省 30%',
+      'type: X Article / 长推 草稿',
+      'status: draft v1',
+      '---',
+      '',
+      '# 标题（备选）',
+    ].join('\n'))
+
+    expect(html).toContain('前置元数据')
+    expect(html).toContain('title: ChatGPT Pro 20x 官方订阅省 30%')
+    expect(html).toContain('type: X Article / 长推 草稿')
+    expect(html).toContain('<h1>标题（备选）</h1>')
+  })
+
+  test('does not treat an opening thematic break as frontmatter without a closing fence', () => {
+    const html = markdownToHtml([
+      '---',
+      '',
+      '# 标题（备选）',
+    ].join('\n'))
+
+    expect(html).toContain('<hr>')
+    expect(html).not.toContain('前置元数据')
+    expect(html).toContain('<h1>标题（备选）</h1>')
+  })
+
+  test('renders markdown tables as standard HTML tables', () => {
+    const html = markdownToHtml([
+      '| Header 1 | Header 2 |',
+      '| --- | --- |',
+      '| Cell 1 | Cell 2 |',
+    ].join('\n'))
+
+    expect(html).toContain('<table>')
+    expect(html).toContain('<th>Header 1</th>')
+    expect(html).toContain('<td>Cell 1</td>')
+  })
+
+  test('renders markdown inside details blocks while preserving the source markdown', () => {
+    const html = markdownToHtml([
+      '<details> <summary>More</summary>',
+      'Hidden **text**',
+      '- item',
+      '</details>',
+    ].join('\n'))
+
+    expect(html).toContain('data-type="raw-html-block"')
+    expect(html).toContain('data-markdown="&lt;details&gt; &lt;summary&gt;More&lt;/summary&gt;&#10;Hidden **text**&#10;- item&#10;&lt;/details&gt;"')
+    expect(html).toContain('&lt;strong&gt;text&lt;/strong&gt;')
+    expect(html).toContain('&lt;li&gt;item&lt;/li&gt;')
+  })
+
+  test('keeps markdown after standalone html media renderable', () => {
+    const html = markdownToHtml([
+      '<img src="晨光.jpg">',
+      '### Agent 模式',
+    ].join('\n'))
+
+    expect(html).toContain('data-type="raw-html-block"')
+    expect(html).toContain('<h3>Agent 模式</h3>')
+    expect(html).not.toContain('&#10;### Agent 模式')
+  })
+
+  test('normalizes invisible heading prefixes after media', () => {
+    const html = markdownToHtml([
+      '![晨光](晨光.jpg)',
+      '\u200b### Agent 模式',
+    ].join('\n'))
+
+    expect(html).toContain('<h3>Agent 模式</h3>')
+  })
+
+  test('parses angle image destinations with local path characters', () => {
+    const html = markdownToHtml('![晨光](<foo bar/晨光 (1)#a.jpg>)')
+
+    expect(html).toContain('<img')
+    expect(html).toContain('src="foo%20bar/%E6%99%A8%E5%85%89%20(1)#a.jpg"')
+    expect(html).toContain('alt="晨光"')
+  })
+
+  test('does not preprocess fenced code blocks as markdown content', () => {
+    const html = markdownToHtml([
+      '```md',
+      '<img src="晨光.jpg">',
+      '### Agent 模式',
+      '\u200b### Hidden',
+      '```',
+    ].join('\n'))
+
+    expect(html).toContain('&lt;img src=&quot;晨光.jpg&quot;&gt;')
+    expect(html).toContain('### Agent 模式')
+    expect(html).toContain('\u200b### Hidden')
+    expect(html).not.toContain('<h3>Agent 模式</h3>')
+    expect(html).not.toContain('<h3>Hidden</h3>')
+  })
+
+  test('does not preprocess indented code blocks as markdown content', () => {
+    const html = markdownToHtml([
+      '    <img src="晨光.jpg">',
+      '    ### Agent 模式',
+    ].join('\n'))
+
+    expect(html).toContain('&lt;img src=&quot;晨光.jpg&quot;&gt;')
+    expect(html).toContain('### Agent 模式')
+    expect(html).not.toContain('<h3>Agent 模式</h3>')
+  })
+})
+
+describe('Agent mention serialization', () => {
+  test('preserves the existing file, Skill, MCP, and session reference protocols', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown([
+      '<p>',
+      '<span data-type="mention" data-id="notes/brief.md" data-mention-suggestion-char="@">brief.md</span> ',
+      '<span data-type="mention" data-id="brainstorming" data-mention-suggestion-char="/">brainstorming</span> ',
+      '<span data-type="mention" data-id="playwright" data-mention-suggestion-char="#">playwright</span> ',
+      '<span data-type="mention" data-id="session-123" data-mention-suggestion-char="&">Current session</span>',
+      '</p>',
+    ].join('')))
+
+    expect(markdown).toBe('@file:notes%2Fbrief.md /skill:brainstorming #mcp:playwright &session:session-123')
+  })
+
+  test('encodes file mention paths containing spaces so @file: regex does not truncate them', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown([
+      '<p>',
+      '<span data-type="mention" data-id="/Users/me/My report.pdf" data-mention-suggestion-char="@">My report.pdf</span> ',
+      '</p>',
+    ].join('')))
+
+    expect(markdown).toBe('@file:%2FUsers%2Fme%2FMy%20report.pdf')
+  })
+
+  test('adds a separator when a mention is followed by adjacent English text', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown([
+      '<p>',
+      '<span data-type="mention" data-id="/Users/me/BPD与LD关系_综合研究报告.pdf" data-mention-suggestion-char="@">BPD与LD关系_综合研究报告.pdf</span>qwedqweq',
+      '</p>',
+    ].join('')))
+
+    expect(markdown).toBe(`@file:${encodeURIComponent('/Users/me/BPD与LD关系_综合研究报告.pdf')} qwedqweq`)
+  })
+  test('serializes planning selections by reference type rather than the trigger character', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown([
+      '<p>',
+      '<span data-type="mention" data-id="todo-123" data-mention-suggestion-char="～" data-mention-reference-type="todo">输入框改造</span> ',
+      '<span data-type="mention" data-id="event-456" data-mention-suggestion-char="~" data-mention-reference-type="calendar_event">产品评审</span>',
+      '</p>',
+    ].join('')))
+
+    expect(markdown).toBe('&todo:todo-123 &calendar_event:event-456')
+  })
+
+  test('persists selected titles for Todo, calendar, and session references', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown([
+      '<p>',
+      '<span data-type="mention" data-id="todo-123" data-label="输入框改造" data-mention-reference-type="todo">输入框改造</span> ',
+      '<span data-type="mention" data-id="event-456" data-label="产品评审" data-mention-reference-type="calendar_event">产品评审</span> ',
+      '<span data-type="mention" data-id="session-789" data-label="修复引用显示" data-mention-suggestion-char="&">修复引用显示</span>',
+      '</p>',
+    ].join('')))
+
+    expect(markdown).toBe([
+      `&todo:todo-123::${encodeURIComponent('输入框改造')}`,
+      `&calendar_event:event-456::${encodeURIComponent('产品评审')}`,
+      `&session:session-789::${encodeURIComponent('修复引用显示')}`,
+    ].join(' '))
+  })
+})
+
+describe('Clipboard 纯文本序列化', () => {
+  test('不改变 Markdown 持久化使用的段落分隔', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown('<p>第一段</p><p>第二段</p>'))
+
+    expect(markdown).toBe('第一段\n\n第二段')
+  })
+
+  test('相邻段落复制为单换行，不带 Markdown 的空段落分隔', () => {
+    const text = withHtmlDocument(() => htmlToClipboardText('<p>第一段</p><p>第二段</p>'))
+
+    expect(text).toBe('第一段\n第二段')
+  })
+
+  test('显式空段落保留一个空行，Windows 换行统一为 LF', () => {
+    const text = withHtmlDocument(() => htmlToClipboardText('<p>第一行\r\n内容</p><p></p><p>第三段</p>'))
+
+    expect(text).toBe('第一行\n内容\n\n第三段')
+  })
+})
+
+describe('图片 Markdown 持久化', () => {
+  test('保留合法宽度，并与后续块级内容分隔', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown('<img src="image.png" alt="截图" width="240"><p>后续内容</p>'))
+
+    expect(markdown).toBe('<img src="image.png" alt="截图" width="240">\n\n后续内容')
+    const html = markdownToHtml(markdown)
+    expect(html).toContain('width=&quot;240&quot;')
+    expect(html).toContain('<p>后续内容</p>')
+  })
+
+  test('丢弃非法图片宽度', () => {
+    const markdown = withHtmlDocument(() => htmlToMarkdown('<img src="image.png" alt="截图" width="-20">'))
+
+    expect(markdown).toBe('![截图](<image.png>)')
+  })
+})
+
+describe('linkify 合成链接防护', () => {
+  test('markdownToHtml 不把 SKILL.md 文件名误判为 URL 链接', () => {
+    const html = markdownToHtml('请查看 SKILL.md 了解更多')
+    expect(html).not.toContain('http://SKILL.md')
+    expect(html).not.toContain('<a')
+  })
+
+  test('markdownToHtml 仍对带 scheme 的真实 URL 自动链接', () => {
+    const html = markdownToHtml('访问 https://example.com 了解更多')
+    expect(html).toContain('<a href="https://example.com">')
+  })
+
+  test('markdownToHtml 不把裸域名 google.com 误判为链接', () => {
+    const html = markdownToHtml('访问 google.com 搜索')
+    expect(html).not.toContain('<a')
+  })
+
+  test('markdownToHtml 不把裸邮箱 foo@bar.com 误判为 mailto 链接', () => {
+    const html = markdownToHtml('联系 foo@bar.com')
+    expect(html).not.toContain('mailto:')
+    expect(html).not.toContain('<a')
+    expect(html).toContain('foo@bar.com')
+  })
+})
