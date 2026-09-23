@@ -89,10 +89,31 @@ cd apps/electron && bun test      # 各包在自己的目录下运行测试
 
 工程约定（IPC 四层契约、状态管理、测试要求等）见 [AGENTS.md](./AGENTS.md)。欢迎提交 Issue 与 Pull Request。
 
-## 许可证与致谢
+## 致谢
+
+Canopy Community 站在许多开源项目的肩膀上，感谢这些项目和它们的贡献者：
+
+- [Proma](https://github.com/proma-ai/Proma)：本项目的上游，Canopy Community 基于它修改而来。
+- [Pi](https://github.com/earendil-works/pi)：Agent 运行时。
+- [Craft Agents OSS](https://github.com/craft-ai-agents/craft-agents-oss)：Agent SDK 集成模式的参考。
+- [Kimi Code](https://github.com/MoonshotAI/kimi-code)：视频输入协议等实现思路。
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)：上下文压缩、执行过程展示等设计思路。
+- [deepseek-vision](https://github.com/ErlichLiu/deepseek-vision)：视觉助手的「视觉中间件」思路。
+- [Cherry Studio](https://github.com/CherryHQ/cherry-studio)：多供应商桌面 AI 客户端，输入框、文件预览与流式渲染的交互启发。
+- [MyAgents](https://github.com/hAcKlyc/MyAgents)、[OpenHanako](https://github.com/liliMozi/openhanako)：工程实践、记忆与主题设计的思路。
+- [open-kimi-ppt-skill](https://github.com/acnlie/open-kimi-ppt-skill)、[ppt-master](https://github.com/hugohe3/ppt-master)、[harness-anything](https://github.com/yb2460/harness-anything)：`canopy-ppt` 的大纲、版式与 SVG 页面契约思路。
+- [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI)：Office 文档读写与预览引擎。
+- [ag-psd](https://github.com/Agamnentzar/ag-psd)、[psd-tools](https://github.com/psd-tools/psd-tools)：PSD 文件读写与高保真合成。
+- [guizang-ppt-skill](https://github.com/op7418/guizang-ppt-skill)：随包的网页 PPT Skill。
+- [skill-creator](https://github.com/anthropics/skills)：随包的 Skill 创建与评测 Skill。
+- [Shiki](https://shiki.style/)、[Mermaid](https://mermaid.js.org/) 与 [Beautiful Mermaid](https://github.com/lukilabs/beautiful-mermaid)、[Lobe Icons](https://github.com/lobehub/lobe-icons)：代码高亮、图表渲染与模型品牌图标。
+
+以上项目的名称与商标归各自所有者，列在这里仅表示感谢，不代表其认可或参与本项目。
+
+## 许可证
 
 本项目以 [GNU AGPL-3.0](./LICENSE) 协议发布。
 
 Canopy Community 基于 [Proma](https://github.com/proma-ai/Proma)（AGPL-3.0）修改而来，保留原项目的版权与许可声明；修改说明见 [NOTICE](./NOTICE)。
 
-Agent 运行时基于 [Pi](https://github.com/earendil-works/pi)（MIT，`@earendil-works/pi-*`）。随附的第三方组件各自遵循其许可：OfficeCLI（Apache-2.0）、guizang-ppt-skill（MIT）、skill-creator（Apache-2.0）、界面音效与插画（CC0）。
+随附的第三方组件各自遵循其许可：Pi（MIT）、ag-psd（MIT）、OfficeCLI（Apache-2.0）、guizang-ppt-skill（MIT）、skill-creator（Apache-2.0）、界面音效与插画（CC0）。psd-tools（MIT）不随包分发，本机装了 Python 版时才会调用。

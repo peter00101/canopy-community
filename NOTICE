@@ -43,6 +43,10 @@ Third-party components keep their own licenses:
 - OfficeCLI (https://github.com/iOfficeAI/OfficeCLI), Apache-2.0. Not stored
   in this repository; the build downloads a pinned release and verifies its
   SHA-256 before bundling it.
+- ag-psd (https://github.com/Agamnentzar/ag-psd), MIT, Copyright (c) 2016
+  Agamnentzar. Bundled into the application build.
+- psd-tools (https://github.com/psd-tools/psd-tools), MIT. Not bundled; used
+  only when a local Python installation provides it.
 - guizang-ppt-skill, MIT; skill-creator, Apache-2.0 (license files are in
   their skill directories).
 - UI sound effects and illustrations, CC0 1.0.

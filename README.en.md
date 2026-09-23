@@ -89,10 +89,31 @@ cd apps/electron && bun test      # run tests inside each package directory
 
 See [AGENTS.md](./AGENTS.md) for engineering conventions (the four-layer IPC contract, state management, testing requirements). Issues and pull requests are welcome.
 
-## License and acknowledgements
+## Acknowledgements
+
+Canopy Community stands on the shoulders of many open-source projects. Thanks to them and their contributors:
+
+- [Proma](https://github.com/proma-ai/Proma) — the upstream project Canopy Community is modified from.
+- [Pi](https://github.com/earendil-works/pi) — the agent runtime.
+- [Craft Agents OSS](https://github.com/craft-ai-agents/craft-agents-oss) — reference for agent SDK integration patterns.
+- [Kimi Code](https://github.com/MoonshotAI/kimi-code) — ideas such as the video input protocol.
+- [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — ideas on context compaction and presenting agent execution.
+- [deepseek-vision](https://github.com/ErlichLiu/deepseek-vision) — the "vision middleware" idea behind the vision assistant.
+- [Cherry Studio](https://github.com/CherryHQ/cherry-studio) — a multi-provider desktop AI client that inspired the composer, file previews and streaming rendering.
+- [MyAgents](https://github.com/hAcKlyc/MyAgents) and [OpenHanako](https://github.com/liliMozi/openhanako) — ideas on engineering practices, memory and theming.
+- [open-kimi-ppt-skill](https://github.com/acnlie/open-kimi-ppt-skill), [ppt-master](https://github.com/hugohe3/ppt-master) and [harness-anything](https://github.com/yb2460/harness-anything) — ideas behind the outline, layout and SVG page contract of `canopy-ppt`.
+- [OfficeCLI](https://github.com/iOfficeAI/OfficeCLI) — the Office document reading, editing and preview engine.
+- [ag-psd](https://github.com/Agamnentzar/ag-psd) and [psd-tools](https://github.com/psd-tools/psd-tools) — PSD reading, writing and high-fidelity compositing.
+- [guizang-ppt-skill](https://github.com/op7418/guizang-ppt-skill) — the bundled web-deck Skill.
+- [skill-creator](https://github.com/anthropics/skills) — the bundled Skill for creating and evaluating Skills.
+- [Shiki](https://shiki.style/), [Mermaid](https://mermaid.js.org/) with [Beautiful Mermaid](https://github.com/lukilabs/beautiful-mermaid), and [Lobe Icons](https://github.com/lobehub/lobe-icons) — code highlighting, diagram rendering and model brand icons.
+
+Project names and trademarks belong to their respective owners. They are listed here only to express our thanks and do not imply endorsement of or involvement in this project.
+
+## License
 
 Released under the [GNU AGPL-3.0](./LICENSE).
 
 Canopy Community is a modified version of [Proma](https://github.com/proma-ai/Proma) (AGPL-3.0); the original copyright and license notices are preserved. See [NOTICE](./NOTICE) for a summary of modifications.
 
-The agent runtime is built on [Pi](https://github.com/earendil-works/pi) (MIT, `@earendil-works/pi-*`). Bundled third-party components keep their own licenses: OfficeCLI (Apache-2.0), guizang-ppt-skill (MIT), skill-creator (Apache-2.0), UI sound effects and illustrations (CC0).
+Bundled third-party components keep their own licenses: Pi (MIT), ag-psd (MIT), OfficeCLI (Apache-2.0), guizang-ppt-skill (MIT), skill-creator (Apache-2.0), UI sound effects and illustrations (CC0). psd-tools (MIT) is not bundled; it is used only when a local Python installation provides it.

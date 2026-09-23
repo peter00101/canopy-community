@@ -1,6 +1,6 @@
 {
   "name": "@canopy/electron",
-  "version": "0.19.17",
+  "version": "0.19.18",
   "description": "Canopy Community - AI Desktop Agent",
   "main": "dist/main.cjs",
   "author": {
